@@ -9,20 +9,43 @@ from playwright.sync_api import sync_playwright
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
-# Bounding Box covering Iran, Israel, Iraq, Syria, Persian Gulf & Strait of Hormuz
+# Regional Bounding Box
 LAT_MIN, LAT_MAX = 24.0, 39.0
 LON_MIN, LON_MAX = 32.0, 65.0
 
-# Strait of Hormuz Center Coordinates for Regional Map Overview
-HORMUZ_LAT = 26.5
-HORMUZ_LON = 56.3
+# Middle East / Iran Regional Overview Coordinates
+REGIONAL_CENTER_LAT = 32.0
+REGIONAL_CENTER_LON = 53.0
 
-# Military, Refueler, Cargo, Drone & Recon Types
-TARGET_TYPES = [
-    "C17", "C130", "C5", "K35R", "KC10", "KC46", "A332", "A400", 
-    "IL76", "AN124", "RC135", "P8", "E3TF", "E8", "E2", "VC25", 
-    "C32", "C40", "E4B", "RQ4", "MQ9", "U2", "B350"
-]
+# Friendly Aircraft Name Mapping for Exact Title Description
+AIRCRAFT_NAMES = {
+    "C17": "C-17A Globemaster III",
+    "C130": "C-130 Hercules",
+    "C30J": "C-130J Super Hercules",
+    "C5": "C-5M Super Galaxy",
+    "K35R": "KC-135 Stratotanker",
+    "KC135": "KC-135 Stratotanker",
+    "KC10": "KC-10 Extender",
+    "KC46": "KC-46 Pegasus",
+    "A332": "A330 MRTT Tanker",
+    "A400": "A400M Atlas",
+    "P8": "P-8A Poseidon ISR",
+    "RC135": "RC-135 Rivet Joint",
+    "E3TF": "E-3 Sentry AWACS",
+    "E3": "E-3 Sentry AWACS",
+    "E8": "E-8 Joint STARS",
+    "E2": "E-2 Hawkeye",
+    "IL76": "Ilyushin Il-76 Cargo",
+    "AN124": "Antonov An-124 Heavy Cargo",
+    "RQ4": "RQ-4 Global Hawk Drone",
+    "MQ9": "MQ-9 Reaper Drone",
+    "VC25": "Air Force One (VC-25)",
+    "C32": "Boeing C-32 VIP",
+    "C40": "Boeing C-40 Clipper"
+}
+
+# Target Aircraft Types
+TARGET_TYPES = list(AIRCRAFT_NAMES.keys())
 
 # Military & Charter Callsign Prefixes
 MIL_CALLSIGNS = [
@@ -51,13 +74,43 @@ def save_seen_flights(seen_set):
         json.dump(recent_list, f)
 
 
+def get_exact_aircraft_title(typecode: str, callsign: str) -> str:
+    """Returns exact descriptive flight title for the caption header"""
+    typecode = typecode.upper().strip()
+    callsign = callsign.upper().strip()
+    
+    exact_name = AIRCRAFT_NAMES.get(typecode, typecode if typecode else "Military Aircraft")
+    
+    if callsign and callsign != "N/A":
+        return f"🚨 {exact_name} ({callsign}) DETECTED 🚨"
+    else:
+        return f"🚨 {exact_name} DETECTED 🚨"
+
+
+def determine_airspace_sector(lat, lon) -> str:
+    """Calculates a dynamic, informative strategic airspace label based on coordinates"""
+    if lat is None or lon is None:
+        return "🌐 Middle East Strategic Airspace"
+
+    if 24.0 <= lat <= 30.0 and 53.0 <= lon <= 60.0:
+        return "🌊 Strait of Hormuz & Persian Gulf Maritime Corridor"
+    elif 25.0 <= lat <= 39.0 and 45.0 <= lon <= 64.0:
+        return "🇮🇷 Iranian Airspace & Central Sector"
+    elif 29.0 <= lat <= 37.0 and 38.0 <= lon <= 46.0:
+        return "🇮🇶 Iraqi Airspace & Northern Levant Zone"
+    elif 29.0 <= lat <= 34.0 and 34.0 <= lon <= 37.0:
+        return "🇮🇱 Levant & Eastern Mediterranean Air Corridor"
+    else:
+        return "🌐 Middle East Regional Airspace Sector"
+
+
 def capture_map_screenshot(icao: str) -> str:
     """Takes a live radar snapshot of a specific flight using Playwright"""
     map_url = f"https://globe.airplanes.live/?icao={icao.lower()}"
-    screenshot_filename = f"map_{icao}.png"
+    screenshot_filename = f"map_flight_{icao}.png"
     
     try:
-        print(f"[ Playwright ] Opening radar map for {icao}...")
+        print(f"[ Playwright ] Capturing flight track map for {icao}...")
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page(viewport={"width": 1280, "height": 720})
@@ -65,31 +118,29 @@ def capture_map_screenshot(icao: str) -> str:
             page.wait_for_timeout(4000)
             page.screenshot(path=screenshot_filename)
             browser.close()
-            print(f"[ Playwright ] Map snapshot captured: {screenshot_filename}")
             return screenshot_filename
     except Exception as e:
-        print(f"[ Error ] Map screenshot failed for {icao}: {e}")
+        print(f"[ Error ] Flight map screenshot failed for {icao}: {e}")
         return None
 
 
-def capture_regional_map_screenshot(lat=HORMUZ_LAT, lon=HORMUZ_LON, zoom=6) -> str:
-    """Captures a regional map screenshot centered over Strait of Hormuz / Middle East"""
-    map_url = f"https://globe.airplanes.live/?lat={lat}&lon={lon}&zoom={zoom}"
-    screenshot_filename = "regional_overview.png"
+def capture_regional_overview_map() -> str:
+    """Captures a wide-angle radar map of Iran & Middle East showing all live flights"""
+    map_url = f"https://globe.airplanes.live/?lat={REGIONAL_CENTER_LAT}&lon={REGIONAL_CENTER_LON}&zoom=5"
+    screenshot_filename = "regional_overview_iran_me.png"
     
     try:
-        print(f"[ Playwright ] Capturing regional overview map ({lat}, {lon})...")
+        print("[ Playwright ] Capturing wide-angle Iran & Middle East regional flight map...")
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page(viewport={"width": 1280, "height": 720})
-            page.goto(map_url, wait_until="networkidle", timeout=30000)
-            page.wait_for_timeout(5000)  # Wait for regional map tiles to render
+            page.goto(map_url, wait_until="networkidle", timeout=35000)
+            page.wait_for_timeout(6000)
             page.screenshot(path=screenshot_filename)
             browser.close()
-            print(f"[ Playwright ] Regional map snapshot saved: {screenshot_filename}")
             return screenshot_filename
     except Exception as e:
-        print(f"[ Error ] Regional screenshot failed: {e}")
+        print(f"[ Error ] Regional overview screenshot failed: {e}")
         return None
 
 
@@ -106,30 +157,40 @@ def get_plane_photo(icao: str) -> str:
     return None
 
 
-def send_telegram_alert(caption: str, screenshot_path: str = None, photo_url: str = None):
-    """Posts photo/screenshot + details caption to Telegram channel"""
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    
-    if screenshot_path and os.path.exists(screenshot_path):
-        with open(screenshot_path, "rb") as image_file:
-            payload = {
-                "chat_id": TELEGRAM_CHANNEL_ID,
-                "caption": caption,
-                "parse_mode": "HTML"
+def send_telegram_media_group(caption: str, photo_paths: list):
+    """Sends a gallery of photos (Regional Overview Map + Flight Track Map) as a single Telegram Media Group"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup"
+    media = []
+    files = {}
+
+    for i, path in enumerate(photo_paths):
+        if path and os.path.exists(path):
+            file_key = f"photo_{i}"
+            files[file_key] = open(path, "rb")
+            media_item = {
+                "type": "photo",
+                "media": f"attach://{file_key}"
             }
-            files = {"photo": image_file}
-            res = requests.post(api_url, data=payload, files=files)
-            os.remove(screenshot_path)
+            if i == 0:
+                media_item["caption"] = caption
+                media_item["parse_mode"] = "HTML"
+            media.append(media_item)
+
+    if media:
+        payload = {"chat_id": TELEGRAM_CHANNEL_ID, "media": json.dumps(media)}
+        try:
+            res = requests.post(url, data=payload, files=files)
+            for f in files.values():
+                f.close()
+            for path in photo_paths:
+                if path and os.path.exists(path):
+                    os.remove(path)
             return res.json()
-    elif photo_url:
-        payload = {
-            "chat_id": TELEGRAM_CHANNEL_ID,
-            "photo": photo_url,
-            "caption": caption,
-            "parse_mode": "HTML"
-        }
-        res = requests.post(api_url, data=payload)
-        return res.json()
+        except Exception as e:
+            print(f"[ Error ] sendMediaGroup failed: {e}")
+            for f in files.values():
+                f.close()
+    return None
 
 
 def fetch_adsb_data():
@@ -137,23 +198,22 @@ def fetch_adsb_data():
     aircraft = []
     headers = {"User-Agent": "OSINT-Flight-Tracker/1.0"}
 
-    # Source 1: Global Military Endpoint from Airplanes.live
+    # Airplanes.live Global Military Endpoint
     try:
         res = requests.get("https://api.airplanes.live/v2/mil", headers=headers, timeout=10)
         if res.status_code == 200:
             aircraft.extend(res.json().get("ac", []))
-    except Exception as e:
-        print(f"[ Warning ] Airplanes.live mil endpoint failed: {e}")
+    except Exception:
+        pass
 
-    # Source 2: Regional Point Search from ADSB.one (Strait of Hormuz area)
+    # ADSB.one Regional Point Search
     try:
-        res = requests.get(f"https://api.adsb.one/v2/point/{HORMUZ_LAT}/{HORMUZ_LON}/250", headers=headers, timeout=10)
+        res = requests.get(f"https://api.adsb.one/v2/point/{REGIONAL_CENTER_LAT}/{REGIONAL_CENTER_LON}/250", headers=headers, timeout=10)
         if res.status_code == 200:
             aircraft.extend(res.json().get("ac", []))
-    except Exception as e:
-        print(f"[ Warning ] ADSB.one point search failed: {e}")
+    except Exception:
+        pass
 
-    # Deduplicate by hex
     unique_ac = {}
     for ac in aircraft:
         hex_code = ac.get("hex")
@@ -193,7 +253,7 @@ def is_target_military(aircraft: dict) -> bool:
 
 def run_tracker():
     print("==================================================")
-    print("   OSINT Flight Tracker (Iran/Israel/Iraq/Hormuz) ")
+    print("   OSINT Regional Sky Radar (Middle East & Iran) ")
     print("==================================================")
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
@@ -209,11 +269,11 @@ def run_tracker():
     ]
     
     total_scanned = len(valid_flights)
-    print(f"[ Scan ] Found {total_scanned} active regional flights.")
+    print(f"[ Scan ] Evaluated {total_scanned} active regional aircraft.")
 
     military_matches = 0
 
-    # 1. PROCESS MILITARY / CARGO / REFUEL FLIGHTS
+    # 1. TARGET MILITARY / CARGO / REFUEL FLIGHT DETECTED
     for ac in valid_flights:
         icao = str(ac.get("hex", "")).strip()
         callsign = str(ac.get("flight", "N/A")).strip()
@@ -230,76 +290,84 @@ def run_tracker():
 
         if is_target_military(ac):
             military_matches += 1
-            print(f"[ MILITARY TARGET FOUND ] Callsign: {callsign} | ICAO: {icao}")
+            sector = determine_airspace_sector(lat, lon)
+            title_header = get_exact_aircraft_title(typecode, callsign)
+
+            print(f"[ TARGET DETECTED ] {title_header} | Sector: {sector}")
 
             if flight_key not in seen_flights:
                 seen_flights.add(flight_key)
 
-                screenshot_file = capture_map_screenshot(icao)
+                regional_overview = capture_regional_overview_map()
+                flight_map = capture_map_screenshot(icao)
                 photo_url = get_plane_photo(icao)
-                photo_link = f"📸 <a href='{photo_url}'>View Aircraft Photo</a>\n" if photo_url else ""
+                photo_link = f"📸 <a href='{photo_url}'>مشاهده عکس هواپیما</a>\n" if photo_url else ""
 
                 caption = (
-                    f"🚨 <b>MILITARY / CARGO / REFUEL DETECTED</b> 🚨\n"
-                    f"📍 <i>Iran - Israel - Iraq - Strait of Hormuz</i>\n\n"
+                    f"<b>{title_header}</b>\n"
+                    f"📍 <b>Sector:</b> <i>{sector}</i>\n\n"
                     f"✈️ <b>Callsign:</b> <code>{callsign}</code>\n"
                     f"🆔 <b>ICAO Hex:</b> <code>{icao.upper()}</code>\n"
                     f"🛩️ <b>Type:</b> <code>{typecode}</code>\n"
-                    f"📈 <b>Altitude:</b> <code>{alt} ft</code>\n"
-                    f"💨 <b>Speed:</b> <code>{speed} kts</code>\n"
+                    f"📈 <b>Altitude:</b> <code>{alt} ft</code> | 💨 <b>Speed:</b> <code>{speed} kts</code>\n"
                     f"🗺️ <b>Coordinates:</b> <code>{lat}, {lon}</code>\n\n"
                     f"{photo_link}"
-                    f"🔗 <a href='https://globe.airplanes.live/?icao={icao}'>Live Radar Track</a>"
+                    f"🔗 <a href='https://globe.airplanes.live/?icao={icao}'>ردیابی زنده رادار</a>\n"
+                    f"✈️ @secretollah"
                 )
 
-                res = send_telegram_alert(caption, screenshot_file, photo_url)
-                print(f"[ Alert Posted ] Response: {res}")
+                photo_list = [p for p in [regional_overview, flight_map] if p]
+                res = send_telegram_media_group(caption, photo_list)
+                print(f"[ Post Status ] Response: {res}")
 
-    # 2. GUARANTEED FALLBACK: IF NO MILITARY FLIGHT IS DETECTED
+    # 2. FALLBACK: REGIONAL RADAR OVERVIEW UPDATE (IF NO MILITARY DETECTED)
     if military_matches == 0:
-        print("[ Info ] No military transponders detected. Generating regional radar map update...")
+        print("[ Info ] No military transponders detected. Capturing dual regional radar gallery...")
         
+        regional_overview = capture_regional_overview_map()
+
         if valid_flights:
-            # Pick an active regional flight to highlight on the map
             selected_ac = random.choice(valid_flights)
             icao = str(selected_ac.get("hex", "")).strip()
             callsign = str(selected_ac.get("flight", "N/A")).strip()
-            typecode = str(selected_ac.get("t", "Civilian / Commercial")).strip()
+            typecode = str(selected_ac.get("t", "Commercial Aviation")).strip()
             alt = selected_ac.get("alt_baro", "N/A")
             speed = selected_ac.get("gs", "N/A")
             lat = selected_ac.get("lat")
             lon = selected_ac.get("lon")
+            sector = determine_airspace_sector(lat, lon)
 
-            screenshot_file = capture_map_screenshot(icao)
+            flight_map = capture_map_screenshot(icao)
             photo_url = get_plane_photo(icao)
-            photo_link = f"📸 <a href='{photo_url}'>View Aircraft Photo</a>\n" if photo_url else ""
+            photo_link = f"📸 <a href='{photo_url}'>مشاهده عکس هواپیما</a>\n" if photo_url else ""
 
             caption = (
-                f"📡 <b>REGIONAL RADAR MAP UPDATE</b>\n"
-                f"📍 <i>Iran - Israel - Iraq - Strait of Hormuz</i>\n\n"
-                f"ℹ️ <i>No active military transponders detected in this scan.</i>\n"
-                f"📊 <b>Active Transponders Evaluated:</b> <code>{total_scanned}</code>\n\n"
-                f"✈️ <b>Highlighted Active Flight:</b> <code>{callsign}</code> ({typecode})\n"
+                f"🌐 <b>REGIONAL AIRSPACE RADAR SCAN</b>\n"
+                f"📍 <b>Sector:</b> <i>{sector}</i>\n\n"
+                f"ℹ️ <i>Routine Scan: 0 military transponders detected in this interval.</i>\n"
+                f"📊 <b>Total Regional Aircraft Monitored:</b> <code>{total_scanned}</code>\n\n"
+                f"✈️ <b>Featured Active Flight:</b> <code>{callsign}</code> ({typecode})\n"
                 f"🆔 <b>ICAO Hex:</b> <code>{icao.upper()}</code>\n"
                 f"📈 <b>Altitude:</b> <code>{alt} ft</code> | 💨 <b>Speed:</b> <code>{speed} kts</code>\n"
-                f"🗺️ <b>Coords:</b> <code>{lat}, {lon}</code>\n\n"
+                f"🗺️ <b>Coordinates:</b> <code>{lat}, {lon}</code>\n\n"
                 f"{photo_link}"
-                f"🔗 <a href='https://globe.airplanes.live/?icao={icao}'>Live Radar Map</a>"
+                f"🔗 <a href='https://globe.airplanes.live/?lat={REGIONAL_CENTER_LAT}&lon={REGIONAL_CENTER_LON}&zoom=5'>ردیابی زنده رادار</a>\n"
+                f"✈️ @secretollah"
             )
+            photo_list = [p for p in [regional_overview, flight_map] if p]
         else:
-            # Capture Strait of Hormuz / Regional Map Overview
-            screenshot_file = capture_regional_map_screenshot()
-            photo_url = None
-
+            sector = determine_airspace_sector(REGIONAL_CENTER_LAT, REGIONAL_CENTER_LON)
             caption = (
-                f"📡 <b>REGIONAL RADAR OVERVIEW UPDATE</b>\n"
-                f"📍 <i>Strait of Hormuz - Persian Gulf - Middle East</i>\n\n"
-                f"ℹ️ <i>Airspace quiet: 0 military transponders detected in this scan.</i>\n\n"
-                f"🔗 <a href='https://globe.airplanes.live/?lat={HORMUZ_LAT}&lon={HORMUZ_LON}&zoom=6'>View Live Regional Globe</a>"
+                f"🌐 <b>REGIONAL AIRSPACE OVERVIEW SCAN</b>\n"
+                f"📍 <b>Sector:</b> <i>{sector}</i>\n\n"
+                f"ℹ️ <i>Quiet regional sky: 0 military transponders detected in this scan interval.</i>\n\n"
+                f"🔗 <a href='https://globe.airplanes.live/?lat={REGIONAL_CENTER_LAT}&lon={REGIONAL_CENTER_LON}&zoom=5'>ردیابی زنده رادار</a>\n"
+                f"✈️ @secretollah"
             )
+            photo_list = [p for p in [regional_overview] if p]
 
-        res = send_telegram_alert(caption, screenshot_file, photo_url)
-        print(f"[ Regional Map Posted ] Response: {res}")
+        res = send_telegram_media_group(caption, photo_list)
+        print(f"[ Regional Update Posted ] Response: {res}")
 
     save_seen_flights(seen_flights)
 
