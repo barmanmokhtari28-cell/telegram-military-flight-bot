@@ -11,8 +11,13 @@ TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 LAT_MIN, LAT_MAX = 12.0, 40.0
 LON_MIN, LON_MAX = 32.0, 65.0
 
-# US Military Cargo Types & Callsigns
-US_MIL_CALLSIGNS = ["RCH", "DUKE", "PAT", "EVAC", "CNV", "TOPCAT", "SNOOP", "JAKE"]
+# Expanded US Military & Allied Transport/Cargo Callsign Prefixes
+US_MIL_CALLSIGNS = [
+    "RCH", "REACH", "DUKE", "PAT", "EVAC", "CNV", "TOPCAT", 
+    "SNOOP", "JAKE", "SAM", "SPAR", "TEAL", "GOLD", "CLEAN", 
+    "NAVY", "EXEC", "DOOM", "HOSER", "TUF", "BOEING"
+]
+
 STATE_FILE = "seen_flights.json"
 
 
@@ -27,7 +32,6 @@ def load_seen_flights():
 
 
 def save_seen_flights(seen_set):
-    # Keep only the last 200 flights to prevent infinite growth
     recent_list = list(seen_set)[-200:]
     with open(STATE_FILE, "w") as f:
         json.dump(recent_list, f)
@@ -48,7 +52,7 @@ def capture_map_screenshot(icao: str) -> str:
             browser.close()
             return screenshot_filename
     except Exception as e:
-        print(f"[ Error ] Screenshot failed: {e}")
+        print(f"[ Error ] Screenshot failed for {icao}: {e}")
         return None
 
 
@@ -88,12 +92,20 @@ def send_telegram_alert(caption: str, screenshot_path: str = None, photo_url: st
         }
         res = requests.post(api_url, data=payload)
         return res.json()
+    else:
+        # Text-only alert fallback
+        text_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHANNEL_ID,
+            "text": caption,
+            "parse_mode": "HTML"
+        }
+        res = requests.post(text_url, data=payload)
+        return res.json()
 
 
 def fetch_opensky_data():
-    """
-    OpenSky Network Free Public API (No credit card or registration required)
-    """
+    """OpenSky Network Free Public API"""
     url = f"https://opensky-network.org/api/states/all?lamin={LAT_MIN}&lamax={LAT_MAX}&lomin={LON_MIN}&lomax={LON_MAX}"
     try:
         res = requests.get(url, timeout=20)
@@ -106,17 +118,18 @@ def fetch_opensky_data():
 
 def is_us_military(icao: str, callsign: str, country: str) -> bool:
     """
-    Identifies US Military flights by ICAO hex prefix (ae/af) or callsign.
-    US Military transponders start with 'ae' or 'af' in hex.
+    US Military Transponders:
+    1. Hex ranges starting with 'ae' or 'af' (US DoD Range).
+    2. Callsign prefixes matching US Air Force / Navy / Army transport units.
     """
-    icao = icao.lower()
+    icao = icao.lower().strip()
     callsign = callsign.upper().strip()
     
-    # 1. US DoD / Military ICAO Hex Range (Starts with 'ae' or 'af')
+    # 1. Check US DoD Hex allocation (AE0000 - AFFFFF)
     if icao.startswith("ae") or icao.startswith("af"):
         return True
     
-    # 2. Known US Military Callsigns
+    # 2. Check military callsign prefixes
     if any(callsign.startswith(prefix) for prefix in US_MIL_CALLSIGNS):
         return True
         
@@ -129,7 +142,10 @@ def run_tracker():
     print(f"[ Info ] OpenSky returned {len(states) if states else 0} flights in target box.")
     
     if not states:
+        print("[ Info ] No aircraft active in bounding box currently.")
         return
+
+    military_matches = 0
 
     for s in states:
         icao = str(s[0]).strip()
@@ -148,30 +164,35 @@ def run_tracker():
 
         flight_key = f"{icao}_{callsign}"
 
-        if is_us_military(icao, callsign, country) and flight_key not in seen_flights:
-            print(f"[ Target Detected ] {callsign} ({icao})")
-            seen_flights.add(flight_key)
+        if is_us_military(icao, callsign, country):
+            military_matches += 1
+            print(f"[ MILITARY TARGET FOUND ] Callsign: {callsign} | ICAO: {icao} | Country: {country}")
             
-            # Take screenshot and get aircraft photo
-            screenshot_file = capture_map_screenshot(icao)
-            photo_url = get_plane_photo(icao)
-            photo_link = f"📸 <a href='{photo_url}'>View Plane Photo</a>\n" if photo_url else ""
+            if flight_key not in seen_flights:
+                seen_flights.add(flight_key)
+                
+                # Take screenshot & fetch plane photo
+                screenshot_file = capture_map_screenshot(icao)
+                photo_url = get_plane_photo(icao)
+                photo_link = f"📸 <a href='{photo_url}'>View Plane Photo</a>\n" if photo_url else ""
 
-            caption = (
-                f"🚨 <b>US MILITARY FLIGHT DETECTED</b> 🚨\n"
-                f"📍 <i>Middle East / Strait of Hormuz</i>\n\n"
-                f"✈️ <b>Callsign:</b> <code>{callsign}</code>\n"
-                f"🆔 <b>ICAO Hex:</b> <code>{icao.upper()}</code>\n"
-                f"🌍 <b>Country:</b> {country}\n"
-                f"📈 <b>Altitude:</b> <code>{alt_ft} ft</code>\n"
-                f"💨 <b>Speed:</b> <code>{speed_kts} kts</code>\n"
-                f"🗺️ <b>Coords:</b> <code>{lat}, {lon}</code>\n\n"
-                f"{photo_link}"
-                f"🔗 <a href='https://globe.adsbexchange.com/?icao={icao}'>Live Radar Track</a>"
-            )
+                caption = (
+                    f"🚨 <b>US MILITARY FLIGHT DETECTED</b> 🚨\n"
+                    f"📍 <i>Middle East / Strait of Hormuz</i>\n\n"
+                    f"✈️ <b>Callsign:</b> <code>{callsign}</code>\n"
+                    f"🆔 <b>ICAO Hex:</b> <code>{icao.upper()}</code>\n"
+                    f"🌍 <b>Country:</b> {country}\n"
+                    f"📈 <b>Altitude:</b> <code>{alt_ft} ft</code>\n"
+                    f"💨 <b>Speed:</b> <code>{speed_kts} kts</code>\n"
+                    f"🗺️ <b>Coords:</b> <code>{lat}, {lon}</code>\n\n"
+                    f"{photo_link}"
+                    f"🔗 <a href='https://globe.adsbexchange.com/?icao={icao}'>Live Radar Track</a>"
+                )
 
-            send_telegram_alert(caption, screenshot_file, photo_url)
+                res = send_telegram_alert(caption, screenshot_file, photo_url)
+                print(f"[ Telegram Response ] {res}")
 
+    print(f"[ Summary ] Processed {len(states)} flights. Found {military_matches} US military aircraft.")
     save_seen_flights(seen_flights)
 
 
