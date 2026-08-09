@@ -11,11 +11,13 @@ TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 LAT_MIN, LAT_MAX = 12.0, 40.0
 LON_MIN, LON_MAX = 32.0, 65.0
 
-# Expanded US Military & Allied Transport/Cargo Callsign Prefixes
+# US Military & US DoD Charter Callsign Prefixes
+# 'CMB' (Camber) is the main US Air Mobility Command contracted military cargo/troop callsign
 US_MIL_CALLSIGNS = [
     "RCH", "REACH", "DUKE", "PAT", "EVAC", "CNV", "TOPCAT", 
     "SNOOP", "JAKE", "SAM", "SPAR", "TEAL", "GOLD", "CLEAN", 
-    "NAVY", "EXEC", "DOOM", "HOSER", "TUF", "BOEING"
+    "NAVY", "EXEC", "DOOM", "HOSER", "TUF", "BOEING",
+    "CMB", "CAMBER", "GTI", "CKS" 
 ]
 
 STATE_FILE = "seen_flights.json"
@@ -35,6 +37,22 @@ def save_seen_flights(seen_set):
     recent_list = list(seen_set)[-200:]
     with open(STATE_FILE, "w") as f:
         json.dump(recent_list, f)
+
+
+def send_telegram_text(text: str):
+    """Sends a basic text message to verify Telegram setup"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHANNEL_ID,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    try:
+        res = requests.post(url, data=payload, timeout=10)
+        return res.json()
+    except Exception as e:
+        print(f"[ Error ] Telegram text alert failed: {e}")
+        return None
 
 
 def capture_map_screenshot(icao: str) -> str:
@@ -57,7 +75,7 @@ def capture_map_screenshot(icao: str) -> str:
 
 
 def get_plane_photo(icao: str) -> str:
-    """Fetches plane photo from Planespotters API (Free)"""
+    """Fetches plane photo from Planespotters API"""
     try:
         url = f"https://api.planespotters.net/pub/photos/hex/{icao}"
         headers = {"User-Agent": "OSINT-Flight-Bot/1.0"}
@@ -92,16 +110,6 @@ def send_telegram_alert(caption: str, screenshot_path: str = None, photo_url: st
         }
         res = requests.post(api_url, data=payload)
         return res.json()
-    else:
-        # Text-only alert fallback
-        text_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHANNEL_ID,
-            "text": caption,
-            "parse_mode": "HTML"
-        }
-        res = requests.post(text_url, data=payload)
-        return res.json()
 
 
 def fetch_opensky_data():
@@ -117,19 +125,14 @@ def fetch_opensky_data():
 
 
 def is_us_military(icao: str, callsign: str, country: str) -> bool:
-    """
-    US Military Transponders:
-    1. Hex ranges starting with 'ae' or 'af' (US DoD Range).
-    2. Callsign prefixes matching US Air Force / Navy / Army transport units.
-    """
     icao = icao.lower().strip()
     callsign = callsign.upper().strip()
     
-    # 1. Check US DoD Hex allocation (AE0000 - AFFFFF)
+    # Check US DoD ICAO Hex allocation (AE0000 - AFFFFF)
     if icao.startswith("ae") or icao.startswith("af"):
         return True
     
-    # 2. Check military callsign prefixes
+    # Check military/charter callsign prefixes
     if any(callsign.startswith(prefix) for prefix in US_MIL_CALLSIGNS):
         return True
         
@@ -139,7 +142,8 @@ def is_us_military(icao: str, callsign: str, country: str) -> bool:
 def run_tracker():
     seen_flights = load_seen_flights()
     states = fetch_opensky_data()
-    print(f"[ Info ] OpenSky returned {len(states) if states else 0} flights in target box.")
+    total_flights = len(states) if states else 0
+    print(f"[ Info ] OpenSky returned {total_flights} flights in target box.")
     
     if not states:
         print("[ Info ] No aircraft active in bounding box currently.")
@@ -149,52 +153,3 @@ def run_tracker():
 
     for s in states:
         icao = str(s[0]).strip()
-        callsign = str(s[1]).strip() if s[1] else "N/A"
-        country = str(s[2]).strip()
-        lon = s[5]
-        lat = s[6]
-        alt_meters = s[7]
-        speed_mps = s[9]
-
-        if not lat or not lon:
-            continue
-
-        alt_ft = int(alt_meters * 3.28084) if alt_meters else "N/A"
-        speed_kts = int(speed_mps * 1.94384) if speed_mps else "N/A"
-
-        flight_key = f"{icao}_{callsign}"
-
-        if is_us_military(icao, callsign, country):
-            military_matches += 1
-            print(f"[ MILITARY TARGET FOUND ] Callsign: {callsign} | ICAO: {icao} | Country: {country}")
-            
-            if flight_key not in seen_flights:
-                seen_flights.add(flight_key)
-                
-                # Take screenshot & fetch plane photo
-                screenshot_file = capture_map_screenshot(icao)
-                photo_url = get_plane_photo(icao)
-                photo_link = f"📸 <a href='{photo_url}'>View Plane Photo</a>\n" if photo_url else ""
-
-                caption = (
-                    f"🚨 <b>US MILITARY FLIGHT DETECTED</b> 🚨\n"
-                    f"📍 <i>Middle East / Strait of Hormuz</i>\n\n"
-                    f"✈️ <b>Callsign:</b> <code>{callsign}</code>\n"
-                    f"🆔 <b>ICAO Hex:</b> <code>{icao.upper()}</code>\n"
-                    f"🌍 <b>Country:</b> {country}\n"
-                    f"📈 <b>Altitude:</b> <code>{alt_ft} ft</code>\n"
-                    f"💨 <b>Speed:</b> <code>{speed_kts} kts</code>\n"
-                    f"🗺️ <b>Coords:</b> <code>{lat}, {lon}</code>\n\n"
-                    f"{photo_link}"
-                    f"🔗 <a href='https://globe.adsbexchange.com/?icao={icao}'>Live Radar Track</a>"
-                )
-
-                res = send_telegram_alert(caption, screenshot_file, photo_url)
-                print(f"[ Telegram Response ] {res}")
-
-    print(f"[ Summary ] Processed {len(states)} flights. Found {military_matches} US military aircraft.")
-    save_seen_flights(seen_flights)
-
-
-if __name__ == "__main__":
-    run_tracker()
