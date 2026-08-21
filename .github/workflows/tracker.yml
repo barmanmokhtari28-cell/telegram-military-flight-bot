@@ -30,7 +30,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
         run: |
-          python bot.py
+          python -u bot.py
 
       - name: Save Tracker State
         run: |
