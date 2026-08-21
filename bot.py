@@ -4,6 +4,7 @@ import traceback
 from datetime import datetime, timezone, timedelta
 
 import requests
+from playwright.sync_api import sync_playwright
 
 # ==================================================================
 # CONFIG
@@ -12,31 +13,33 @@ import requests
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
-# Overall regional bounding box (Iran + Middle East)
-LAT_MIN, LAT_MAX = 12.0, 42.0
-LON_MIN, LON_MAX = 32.0, 65.0
+# Regional bounding box -- narrowed to Iran + the Gulf Arab states
+# (Saudi Arabia, UAE, Qatar, Bahrain, Kuwait, Oman)
+LAT_MIN, LAT_MAX = 16.0, 39.0
+LON_MIN, LON_MAX = 44.0, 63.0
 
-# Grid of search points used to tile the region for the point-search API
-# (each call only covers a ~250nm radius circle, so a single call from
-# the center of the box misses most of it).
+# Grid of search points tiling Iran + the Gulf Arab countries (each
+# point-search call only covers a ~250nm radius circle)
 REGION_POINTS = [
     ("Tehran / Central Iran", 35.7, 51.4),
     ("Strait of Hormuz / S. Iran", 26.5, 56.0),
     ("SW Iran / N. Persian Gulf", 30.0, 49.0),
-    ("E. Iran / Afghan border", 32.0, 60.5),
-    ("Iraq", 33.3, 44.4),
-    ("N. Iraq / Syria border", 36.5, 41.0),
-    ("Israel / Levant", 31.5, 35.0),
-    ("Saudi Arabia / S. Gulf", 24.5, 49.5),
-    ("Red Sea / Bab-el-Mandeb", 15.5, 42.5),
+    ("E. Iran", 32.0, 60.5),
+    ("Saudi Arabia / Eastern Province", 26.0, 50.0),
+    ("UAE / Qatar / Bahrain", 25.0, 54.0),
+    ("Kuwait", 29.3, 47.9),
+    ("Oman / S. Hormuz approach", 23.5, 58.5),
 ]
 POINT_RADIUS_NM = 250
 
-# Sub-box used for the civilian "mass diversion" anomaly baseline.
-# This is the Hormuz / Iranian Gulf corridor -- the highest-signal area
-# for airlines quietly rerouting away from Iranian airspace.
+# Sub-box used for the civilian "mass diversion" anomaly baseline --
+# the Hormuz / Iranian Gulf corridor, the highest-signal area for
+# airlines quietly rerouting away from Iranian airspace.
 HORMUZ_LAT_MIN, HORMUZ_LAT_MAX = 24.0, 30.0
 HORMUZ_LON_MIN, HORMUZ_LON_MAX = 53.0, 60.0
+
+# Center point / zoom used for the regional overview screenshot
+OVERVIEW_LAT, OVERVIEW_LON, OVERVIEW_ZOOM = 26.0, 54.0, 6
 
 STATE_FILE = "state.json"
 LEGACY_STATE_FILE = "seen_flights.json"  # from the old version of this bot
@@ -65,7 +68,6 @@ AIRCRAFT_NAMES = {
 }
 TARGET_TYPES = list(AIRCRAFT_NAMES.keys())
 
-# Category buckets used for escalation pattern-matching
 CATEGORY_BY_TYPE = {}
 for t in ["K35R", "KC135", "KC10", "KC46", "A332", "A400"]:
     CATEGORY_BY_TYPE[t] = "TANKER"
@@ -84,11 +86,6 @@ MIL_CALLSIGNS = [
     "DOOM", "HOSER", "TUF", "BOEING", "CMB", "CAMBER", "GTI", "CKS",
     "NATO", "RRR", "CTM", "IAF", "LAGR", "NCHO", "FORTE", "HOMER",
 ]
-
-# Major Iranian carriers (ICAO callsign prefixes), used for the civilian
-# "travel flights" filter -- Iran Air, Caspian, Mahan, Iran Aseman,
-# Qeshm, Varesh, Zagros
-IRAN_AIRLINE_ICAO_PREFIXES = ["IRA", "IRC", "IRM", "IRB", "CQH", "VRC", "ZAG"]
 
 now_utc = lambda: datetime.now(timezone.utc)
 
@@ -117,9 +114,9 @@ def load_state():
             pass
 
     return {
-        "seen_flights": seen,          # [{"key": "<icao>_<callsign>", "ts": iso}]
-        "mil_snapshot_log": [],        # [{"ts": iso, "count": N}]
-        "civil_corridor_log": [],      # [{"ts": iso, "count": N}]
+        "seen_flights": seen,
+        "mil_snapshot_log": [],
+        "civil_corridor_log": [],
         "last_escalation_level": "LOW",
         "last_fallback_post_ts": None,
     }
@@ -158,13 +155,9 @@ def mark_seen(state, flight_key):
 # ==================================================================
 
 def fetch_adsb_data():
-    """Fetches aircraft from multiple open OSINT endpoints, tiled across
-    the whole region (a single point-search only covers a small circle)."""
     aircraft = []
     headers = {"User-Agent": "OSINT-Flight-Tracker/1.0"}
 
-    # Global military endpoint -- catches military-flagged aircraft
-    # anywhere, which we then filter down to the regional bounding box.
     try:
         res = requests.get("https://api.airplanes.live/v2/mil", headers=headers, timeout=10)
         if res.status_code == 200:
@@ -172,8 +165,6 @@ def fetch_adsb_data():
     except Exception as e:
         print(f"[ Warn ] Global mil endpoint failed: {e}")
 
-    # Tiled point searches across the region, to pick up civilian traffic
-    # (and any military aircraft not flagged by the endpoint above).
     for label, lat, lon in REGION_POINTS:
         try:
             res = requests.get(
@@ -195,8 +186,6 @@ def fetch_adsb_data():
 
 
 def get_plane_photo(icao: str):
-    """Direct photo URL from Planespotters -- Telegram fetches it
-    server-side via sendPhoto, no local rendering needed."""
     try:
         url = f"https://api.planespotters.net/pub/photos/hex/{icao}"
         headers = {"User-Agent": "OSINT-Flight-Bot/1.0"}
@@ -206,6 +195,51 @@ def get_plane_photo(icao: str):
     except Exception:
         pass
     return None
+
+
+# ==================================================================
+# SCREENSHOTS (Playwright)
+#
+# NOTE: the original version of this bot used wait_until="networkidle",
+# which never fires on a live radar page (it's constantly polling in
+# the background), so every screenshot call silently timed out and
+# returned nothing. Fixed here by waiting for DOM content + a fixed
+# render delay instead of waiting for network silence that never comes.
+# ==================================================================
+
+def _screenshot(map_url: str, filename: str, render_wait_ms: int = 7000):
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 720})
+            page.goto(map_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(render_wait_ms)  # let tiles + markers render
+            page.screenshot(path=filename)
+            browser.close()
+            return filename
+    except Exception as e:
+        print(f"[ Error ] Screenshot failed for {map_url}: {e}")
+        return None
+
+
+def capture_map_screenshot(icao: str) -> str:
+    map_url = f"https://globe.airplanes.live/?icao={icao.lower()}"
+    print(f"[ Playwright ] Capturing flight track map for {icao}...")
+    return _screenshot(map_url, f"map_flight_{icao}.png", render_wait_ms=6000)
+
+
+def capture_regional_overview_map() -> str:
+    map_url = f"https://globe.airplanes.live/?lat={OVERVIEW_LAT}&lon={OVERVIEW_LON}&zoom={OVERVIEW_ZOOM}"
+    print("[ Playwright ] Capturing Iran + Gulf regional overview map...")
+    return _screenshot(map_url, "regional_overview_iran_gulf.png", render_wait_ms=8000)
+
+
+def cleanup_file(path):
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 
 # ==================================================================
@@ -242,19 +276,21 @@ def classify_type(typecode: str):
 
 def determine_airspace_sector(lat, lon) -> str:
     if lat is None or lon is None:
-        return "🌐 Middle East Strategic Airspace"
+        return "🌐 Iran / Gulf Strategic Airspace"
     if HORMUZ_LAT_MIN <= lat <= HORMUZ_LAT_MAX and HORMUZ_LON_MIN <= lon <= HORMUZ_LON_MAX:
         return "🌊 Strait of Hormuz & Persian Gulf Maritime Corridor"
-    elif 25.0 <= lat <= 39.0 and 45.0 <= lon <= 64.0:
+    elif 25.0 <= lat <= 39.0 and 45.0 <= lon <= 63.0:
         return "🇮🇷 Iranian Airspace & Central Sector"
-    elif 29.0 <= lat <= 37.0 and 38.0 <= lon <= 46.0:
-        return "🇮🇶 Iraqi Airspace & Northern Levant Zone"
-    elif 29.0 <= lat <= 34.0 and 34.0 <= lon <= 37.0:
-        return "🇮🇱 Levant & Eastern Mediterranean Air Corridor"
-    elif 12.0 <= lat <= 20.0:
-        return "🌊 Red Sea / Bab-el-Mandeb Corridor"
+    elif 22.0 <= lat <= 27.0 and 46.0 <= lon <= 52.0:
+        return "🇸🇦 Saudi Arabia / Eastern Gulf Sector"
+    elif 22.5 <= lat <= 26.5 and 50.5 <= lon <= 56.5:
+        return "🇦🇪🇶🇦🇧🇭 UAE / Qatar / Bahrain Sector"
+    elif 28.5 <= lat <= 30.5 and 46.5 <= lon <= 49.0:
+        return "🇰🇼 Kuwait Sector"
+    elif 16.0 <= lat <= 26.5 and 51.5 <= lon <= 60.0:
+        return "🇴🇲 Oman / S. Hormuz Approach Sector"
     else:
-        return "🌐 Middle East Regional Airspace Sector"
+        return "🌐 Iran / Gulf Regional Airspace Sector"
 
 
 def get_exact_aircraft_title(typecode: str, callsign: str) -> str:
@@ -287,7 +323,6 @@ def compute_escalation(state, current_mil_snapshot, current_civil_corridor_count
     score = 0
     factors = []
 
-    # --- Volume signal: current mil count vs rolling baseline ---
     one_hour_ago = now_utc() - timedelta(hours=1)
     day_ago = now_utc() - timedelta(hours=24)
     recent_log = [s for s in state["mil_snapshot_log"] if datetime.fromisoformat(s["ts"]) > day_ago]
@@ -302,7 +337,6 @@ def compute_escalation(state, current_mil_snapshot, current_civil_corridor_count
         score += 20
         factors.append(f"High absolute military volume: {current_count} active aircraft in region")
 
-    # --- Pattern signal: category combos in the current snapshot ---
     categories_present = set()
     for ac in current_mil_snapshot:
         cat = classify_type(str(ac.get("t", "")).upper().strip())
@@ -327,7 +361,6 @@ def compute_escalation(state, current_mil_snapshot, current_civil_corridor_count
         score += 10
         factors.append(f"Airlift surge: {cargo_count} military cargo aircraft active simultaneously")
 
-    # --- Civilian anomaly: mass avoidance of the Hormuz/Gulf corridor ---
     civil_baseline_counts = [s["count"] for s in state["civil_corridor_log"]
                               if datetime.fromisoformat(s["ts"]) <= one_hour_ago]
     civil_baseline = (sum(civil_baseline_counts) / len(civil_baseline_counts)) if civil_baseline_counts else 0
@@ -361,29 +394,68 @@ def send_telegram_message(text):
         return None
 
 
-def send_telegram_photo(photo_url, caption):
+def send_telegram_photo_file(photo_path, caption):
+    """Sends a single locally-saved screenshot as a photo message."""
+    if not photo_path or not os.path.exists(photo_path):
+        return send_telegram_message(caption)
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    payload = {
-        "chat_id": TELEGRAM_CHANNEL_ID, "photo": photo_url,
-        "caption": caption, "parse_mode": "HTML",
-    }
     try:
-        res = requests.post(url, data=payload, timeout=20).json()
+        with open(photo_path, "rb") as f:
+            files = {"photo": f}
+            data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+            res = requests.post(url, data=data, files=files, timeout=30).json()
         if not res.get("ok"):
-            # photo URL might be dead/unfetchable by Telegram -- fall back to text
-            print(f"[ Warn ] sendPhoto failed ({res}), falling back to text")
+            print(f"[ Warn ] sendPhoto (file) failed ({res}), falling back to text")
             return send_telegram_message(caption)
         return res
     except Exception as e:
-        print(f"[ Error ] sendPhoto failed: {e}, falling back to text")
+        print(f"[ Error ] sendPhoto (file) failed: {e}, falling back to text")
         return send_telegram_message(caption)
+
+
+def send_telegram_media_group(caption, photo_paths):
+    """Sends a gallery of local screenshots (regional overview + flight
+    track) as a single Telegram media group."""
+    valid_paths = [p for p in photo_paths if p and os.path.exists(p)]
+    if not valid_paths:
+        return send_telegram_message(caption)
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup"
+    media = []
+    files = {}
+    opened = []
+    try:
+        for i, path in enumerate(valid_paths):
+            file_key = f"photo_{i}"
+            fh = open(path, "rb")
+            opened.append(fh)
+            files[file_key] = fh
+            item = {"type": "photo", "media": f"attach://{file_key}"}
+            if i == 0:
+                item["caption"] = caption
+                item["parse_mode"] = "HTML"
+            media.append(item)
+
+        payload = {"chat_id": TELEGRAM_CHANNEL_ID, "media": json.dumps(media)}
+        res = requests.post(url, data=payload, files=files, timeout=30).json()
+        if not res.get("ok"):
+            print(f"[ Warn ] sendMediaGroup failed ({res}), falling back to text")
+            return send_telegram_message(caption)
+        return res
+    except Exception as e:
+        print(f"[ Error ] sendMediaGroup failed: {e}, falling back to text")
+        return send_telegram_message(caption)
+    finally:
+        for fh in opened:
+            fh.close()
 
 
 def emoji_line(emoji, score, label):
     return f"{emoji} <b>Regional escalation index:</b> <code>{score}/100 ({label})</code>\n\n"
 
 
-def post_detection(ac, sector, escalation_score, escalation_label_str, escalation_emoji):
+def post_detection(ac, sector, escalation_score, escalation_label_str, escalation_emoji, overview_path):
     icao = str(ac.get("hex", "")).strip()
     callsign = str(ac.get("flight", "N/A")).strip() or "N/A"
     typecode = str(ac.get("t", "Unknown Type")).strip()
@@ -393,6 +465,8 @@ def post_detection(ac, sector, escalation_score, escalation_label_str, escalatio
     title_header = get_exact_aircraft_title(typecode, callsign)
 
     photo_url = get_plane_photo(icao)
+    photo_link = f"📸 <a href='{photo_url}'>مشاهده عکس هواپیما</a>\n" if photo_url else ""
+    flight_map = capture_map_screenshot(icao)
 
     caption = (
         f"<b>{title_header}</b>\n"
@@ -402,17 +476,19 @@ def post_detection(ac, sector, escalation_score, escalation_label_str, escalatio
         f"🛩️ <b>Type:</b> <code>{typecode}</code>\n"
         f"📈 <b>Altitude:</b> <code>{alt} ft</code> | 💨 <b>Speed:</b> <code>{speed} kts</code>\n"
         f"🗺️ <b>Coordinates:</b> <code>{lat}, {lon}</code>\n\n"
+        f"{photo_link}"
         f"{emoji_line(escalation_emoji, escalation_score, escalation_label_str)}"
         f"🔗 <a href='https://globe.airplanes.live/?icao={icao}'>ردیابی زنده رادار</a>\n"
         f"✈️ @secretollah"
     )
 
-    if photo_url:
-        return send_telegram_photo(photo_url, caption)
-    return send_telegram_message(caption)
+    photo_list = [p for p in [overview_path, flight_map] if p]
+    res = send_telegram_media_group(caption, photo_list) if photo_list else send_telegram_message(caption)
+    cleanup_file(flight_map)
+    return res
 
 
-def post_escalation_change(old_label, new_label, score, emoji, factors):
+def post_escalation_change(old_label, new_label, score, emoji, factors, overview_path):
     direction = "🔺 ESCALATION" if _band_rank(new_label) > _band_rank(old_label) else "🔻 DE-ESCALATION"
     factor_text = "\n".join(f"• {f}" for f in factors) if factors else "• No specific contributing factors logged"
     text = (
@@ -422,33 +498,33 @@ def post_escalation_change(old_label, new_label, score, emoji, factors):
         f"<b>Contributing factors:</b>\n{factor_text}\n\n"
         f"✈️ @secretollah"
     )
-    return send_telegram_message(text)
+    return send_telegram_photo_file(overview_path, text)
 
 
-def post_civil_anomaly(current_count, baseline):
+def post_civil_anomaly(current_count, baseline, overview_path):
     text = (
         f"🟡 <b>CIVIL TRAFFIC ANOMALY — Hormuz/Gulf Corridor</b>\n\n"
         f"Civilian flight volume in the Strait of Hormuz / Persian Gulf corridor has dropped to "
         f"<code>{current_count}</code> aircraft, versus a recent baseline of ~<code>{baseline:.1f}</code>.\n"
         f"This can indicate airlines proactively rerouting away from the area due to perceived risk.\n\n"
-        f"🔗 <a href='https://globe.airplanes.live/?lat=27&lon=56&zoom=6'>ردیابی زنده رادار</a>\n"
+        f"🔗 <a href='https://globe.airplanes.live/?lat={OVERVIEW_LAT}&lon={OVERVIEW_LON}&zoom={OVERVIEW_ZOOM}'>ردیابی زنده رادار</a>\n"
         f"✈️ @secretollah"
     )
-    return send_telegram_message(text)
+    return send_telegram_photo_file(overview_path, text)
 
 
-def post_heartbeat(total_scanned, mil_count, civil_corridor_count, escalation_score, label, emoji):
+def post_heartbeat(total_scanned, mil_count, civil_corridor_count, escalation_score, label, emoji, overview_path):
     text = (
-        f"🌐 <b>REGIONAL AIRSPACE STATUS</b>\n\n"
+        f"🌐 <b>IRAN / GULF AIRSPACE STATUS</b>\n\n"
         f"ℹ️ <i>Routine interval check — no new military detections this cycle.</i>\n"
         f"📊 <b>Total regional aircraft monitored:</b> <code>{total_scanned}</code>\n"
         f"🪖 <b>Active military aircraft:</b> <code>{mil_count}</code>\n"
         f"🌊 <b>Civil traffic — Hormuz/Gulf corridor:</b> <code>{civil_corridor_count}</code>\n\n"
         f"{emoji_line(emoji, escalation_score, label)}"
-        f"🔗 <a href='https://globe.airplanes.live/?lat=32&lon=53&zoom=5'>ردیابی زنده رادار</a>\n"
+        f"🔗 <a href='https://globe.airplanes.live/?lat={OVERVIEW_LAT}&lon={OVERVIEW_LON}&zoom={OVERVIEW_ZOOM}'>ردیابی زنده رادار</a>\n"
         f"✈️ @secretollah"
     )
-    return send_telegram_message(text)
+    return send_telegram_photo_file(overview_path, text)
 
 
 def _band_rank(label):
@@ -462,7 +538,7 @@ def _band_rank(label):
 
 def run_tracker():
     print("==================================================")
-    print("   OSINT Regional Sky Radar (Middle East & Iran)  ")
+    print("   OSINT Sky Radar — Iran & Gulf Arab States       ")
     print("==================================================")
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
@@ -482,7 +558,6 @@ def run_tracker():
         if not is_target_military(ac) and in_hormuz_corridor(ac.get("lat"), ac.get("lon"))
     ]
 
-    # Log this run's snapshot counts for future baseline calculations
     state["mil_snapshot_log"].append({"ts": now_utc().isoformat(), "count": len(current_mil_snapshot)})
     state["civil_corridor_log"].append({"ts": now_utc().isoformat(), "count": len(civil_corridor_flights)})
 
@@ -491,52 +566,61 @@ def run_tracker():
     )
     print(f"[ Escalation ] {escalation_score}/100 ({escalation_lvl}) — factors: {factors}")
 
-    # --- Post individual alerts for newly-seen military aircraft ---
-    new_detections = 0
-    for ac in current_mil_snapshot:
-        icao = str(ac.get("hex", "")).strip()
-        callsign = str(ac.get("flight", "N/A")).strip()
-        if not icao:
-            continue
-        flight_key = f"{icao}_{callsign}"
-        if is_recently_seen(state, flight_key):
-            continue
+    # Always capture the regional overview screenshot once per run,
+    # regardless of escalation level -- reused across every message
+    # this run sends, then cleaned up at the end.
+    overview_path = capture_regional_overview_map()
 
-        mark_seen(state, flight_key)
-        new_detections += 1
-        sector = determine_airspace_sector(ac.get("lat"), ac.get("lon"))
-        res = post_detection(ac, sector, escalation_score, escalation_lvl, escalation_emoji)
-        print(f"[ Posted ] {icao} {callsign} -> {res}")
+    try:
+        # --- Post individual alerts for newly-seen military aircraft ---
+        new_detections = 0
+        for ac in current_mil_snapshot:
+            icao = str(ac.get("hex", "")).strip()
+            callsign = str(ac.get("flight", "N/A")).strip()
+            if not icao:
+                continue
+            flight_key = f"{icao}_{callsign}"
+            if is_recently_seen(state, flight_key):
+                continue
 
-    print(f"[ Summary ] {new_detections} new military detections this cycle "
-          f"({len(current_mil_snapshot)} currently active in region).")
+            mark_seen(state, flight_key)
+            new_detections += 1
+            sector = determine_airspace_sector(ac.get("lat"), ac.get("lon"))
+            res = post_detection(ac, sector, escalation_score, escalation_lvl, escalation_emoji, overview_path)
+            print(f"[ Posted ] {icao} {callsign} -> {res}")
 
-    # --- Escalation level change notification ---
-    if escalation_lvl != state.get("last_escalation_level", "LOW"):
-        post_escalation_change(state.get("last_escalation_level", "LOW"), escalation_lvl,
-                                escalation_score, escalation_emoji, factors)
-        state["last_escalation_level"] = escalation_lvl
+        print(f"[ Summary ] {new_detections} new military detections this cycle "
+              f"({len(current_mil_snapshot)} currently active in region).")
 
-    # --- Civil anomaly alert (independent of escalation band change) ---
-    civil_anomaly_factor = next((f for f in factors if "Hormuz/Gulf corridor" in f), None)
-    if civil_anomaly_factor:
-        one_hour_ago = now_utc() - timedelta(hours=1)
-        baseline_counts = [s["count"] for s in state["civil_corridor_log"]
-                            if datetime.fromisoformat(s["ts"]) <= one_hour_ago]
-        baseline = (sum(baseline_counts) / len(baseline_counts)) if baseline_counts else 0
-        post_civil_anomaly(len(civil_corridor_flights), baseline)
+        # --- Escalation level change notification (always includes screenshot) ---
+        if escalation_lvl != state.get("last_escalation_level", "LOW"):
+            post_escalation_change(state.get("last_escalation_level", "LOW"), escalation_lvl,
+                                    escalation_score, escalation_emoji, factors, overview_path)
+            state["last_escalation_level"] = escalation_lvl
 
-    # --- Heartbeat: only if nothing new happened AND it's been a while ---
-    if new_detections == 0:
-        last_fb = state.get("last_fallback_post_ts")
-        should_post_heartbeat = (
-            last_fb is None
-            or datetime.fromisoformat(last_fb) < now_utc() - timedelta(hours=1)
-        )
-        if should_post_heartbeat:
-            post_heartbeat(total_scanned, len(current_mil_snapshot), len(civil_corridor_flights),
-                           escalation_score, escalation_lvl, escalation_emoji)
-            state["last_fallback_post_ts"] = now_utc().isoformat()
+        # --- Civil anomaly alert (independent of escalation band change) ---
+        civil_anomaly_factor = next((f for f in factors if "Hormuz/Gulf corridor" in f), None)
+        if civil_anomaly_factor:
+            one_hour_ago = now_utc() - timedelta(hours=1)
+            baseline_counts = [s["count"] for s in state["civil_corridor_log"]
+                                if datetime.fromisoformat(s["ts"]) <= one_hour_ago]
+            baseline = (sum(baseline_counts) / len(baseline_counts)) if baseline_counts else 0
+            post_civil_anomaly(len(civil_corridor_flights), baseline, overview_path)
+
+        # --- Heartbeat: only if nothing new happened AND it's been a while ---
+        # (still includes the regional screenshot, even at LOW escalation)
+        if new_detections == 0:
+            last_fb = state.get("last_fallback_post_ts")
+            should_post_heartbeat = (
+                last_fb is None
+                or datetime.fromisoformat(last_fb) < now_utc() - timedelta(hours=1)
+            )
+            if should_post_heartbeat:
+                post_heartbeat(total_scanned, len(current_mil_snapshot), len(civil_corridor_flights),
+                               escalation_score, escalation_lvl, escalation_emoji, overview_path)
+                state["last_fallback_post_ts"] = now_utc().isoformat()
+    finally:
+        cleanup_file(overview_path)
 
     save_state(state)
 
