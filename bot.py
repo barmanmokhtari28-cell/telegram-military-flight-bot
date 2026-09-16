@@ -23,6 +23,10 @@ OPENSKY_PASS = os.getenv("OPENSKY_PASS")
 LAT_MIN, LAT_MAX = 15.0, 39.0
 LON_MIN, LON_MAX = 32.0, 63.0
 
+# Iranian Airspace Boundary box for 12-hour report
+IRAN_LAT_MIN, IRAN_LAT_MAX = 25.0, 39.0
+IRAN_LON_MIN, IRAN_LON_MAX = 44.0, 63.5
+
 # Strategic points covering key choke points, logistics hubs & corridors
 REGION_POINTS = [
     ("Al Udeid / Persian Gulf / Qatar", 25.1, 51.3),
@@ -98,7 +102,7 @@ AIRCRAFT_NAMES = {
 
 US_CALLSIGN_PREFIXES = [
     "RCH", "REACH", "MOOSE", "SLAM", "ORDER",  # Air Mobility Command (AMC)
-    "LAGR", "NCHO", "GOLD", "CLEAN", "BOBBY", "PEARL", "SHELL",  # Tankers
+    "LAGR", "NCHO", "GOLD", "CLEAN", "BOBBY", "PEARL", "SHELL", "ESSO",  # Tankers
     "FORTE", "HOMER", "OLIVE", "COBRA", "PYTHON", "SNOOP", "JAKE",  # ISR / Recon
     "DOOM", "DEATH", "MYTEE", "BONE", "DARK", "SKULL",  # Bombers
     "NAVY", "TOPCAT", "VNDL", "GOTO",  # US Navy
@@ -117,7 +121,6 @@ def is_us_military_hex(icao_hex: str) -> bool:
     """Mode-S hex range allocated to US DoD / Military."""
     try:
         val = int(icao_hex, 16)
-        # ae0000 to aeffff or af0000 to afffff
         return (0xAE0000 <= val <= 0xAFFFFF)
     except Exception:
         return False
@@ -137,21 +140,20 @@ def load_state():
         "seen_flights": [],
         "mil_snapshot_log": [],
         "civil_corridor_log": [],
-        "last_escalation_level": "LOW",
-        "last_fallback_post_ts": None,
+        "last_12h_report_ts": None,
     }
 
 def save_state(state):
     cutoff = now_utc() - timedelta(hours=48)
     state["seen_flights"] = [
-        s for s in state["seen_flights"]
+        s for s in state.get("seen_flights", [])
         if datetime.fromisoformat(s["ts"]) > now_utc() - timedelta(hours=REANNOUNCE_AFTER_HOURS)
     ][-1000:]
     state["mil_snapshot_log"] = [
-        s for s in state["mil_snapshot_log"] if datetime.fromisoformat(s["ts"]) > cutoff
+        s for s in state.get("mil_snapshot_log", []) if datetime.fromisoformat(s["ts"]) > cutoff
     ][-500:]
     state["civil_corridor_log"] = [
-        s for s in state["civil_corridor_log"] if datetime.fromisoformat(s["ts"]) > (now_utc() - timedelta(days=14))
+        s for s in state.get("civil_corridor_log", []) if datetime.fromisoformat(s["ts"]) > (now_utc() - timedelta(days=14))
     ][-2000:]
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
@@ -169,7 +171,7 @@ def mark_seen(state, flight_key):
 def fetch_from_adsb_lol():
     results = []
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json",
     }
     # 1. Global military feed
@@ -225,7 +227,6 @@ def fetch_from_opensky():
             states = data.get("states", []) or []
             log(f"[ OpenSky ] Regional query returned {len(states)} aircraft")
             for s in states:
-                # OpenSky format: [icao24, callsign, origin_country, time_pos, last_contact, lon, lat, baro_alt, on_ground, vel, track, ...]
                 results.append({
                     "hex": str(s[0]).strip().lower(),
                     "flight": str(s[1]).strip() if s[1] else "",
@@ -234,7 +235,7 @@ def fetch_from_opensky():
                     "alt_baro": int(s[7] * 3.28084) if s[7] is not None else None,
                     "gs": int(s[9] * 1.94384) if s[9] is not None else None,
                     "track": s[10],
-                    "t": "",  # OpenSky basic state vector doesn't have aircraft type
+                    "t": "",
                     "dbFlags": 1 if s[2] == "United States" and is_us_military_hex(str(s[0])) else 0,
                 })
     except Exception as e:
@@ -247,7 +248,6 @@ def fetch_all_aircraft():
     raw.extend(fetch_from_adsb_lol())
     raw.extend(fetch_from_adsb_fi())
 
-    # If primary community feeds were blocked/down, fallback to OpenSky
     if len(raw) == 0:
         log("[ Fallback ] Primary ADS-B sources yielded 0. Polling OpenSky Network...")
         raw.extend(fetch_from_opensky())
@@ -278,6 +278,9 @@ def get_plane_photo(icao: str):
 
 def in_region(lat, lon) -> bool:
     return lat is not None and lon is not None and LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX
+
+def in_iran_airspace(lat, lon) -> bool:
+    return lat is not None and lon is not None and IRAN_LAT_MIN <= lat <= IRAN_LAT_MAX and IRAN_LON_MIN <= lon <= IRAN_LON_MAX
 
 def in_hormuz_corridor(lat, lon) -> bool:
     return (lat is not None and lon is not None
@@ -346,15 +349,27 @@ def determine_airspace_sector(lat, lon) -> str:
     return "🌐 Regional Middle East Sector"
 
 # ==================================================================
-# SCREENSHOTS (Playwright)
+# SCREENSHOTS (Playwright - Optimized with NetworkIdle & Real Headers)
 # ==================================================================
 
-def _screenshot(map_url: str, filename: str, render_wait_ms: int = 7000):
+def _screenshot(map_url: str, filename: str, render_wait_ms: int = 8000):
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(viewport={"width": 1280, "height": 720})
-            page.goto(map_url, wait_until="domcontentloaded", timeout=30000)
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                ],
+            )
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            )
+            page = context.new_page()
+            page.goto(map_url, wait_until="networkidle", timeout=45000)
             page.wait_for_timeout(render_wait_ms)
             page.screenshot(path=filename)
             browser.close()
@@ -365,12 +380,12 @@ def _screenshot(map_url: str, filename: str, render_wait_ms: int = 7000):
         return None
 
 def capture_flight_map(icao: str) -> str:
-    map_url = f"https://globe.adsb.lol/?icao={icao.lower()}"
+    map_url = f"https://globe.adsb.lol/?icao={icao.lower()}&hideSidebar"
     return _screenshot(map_url, f"map_{icao}.png", render_wait_ms=5000)
 
 def capture_regional_overview_map() -> str:
-    map_url = f"https://globe.adsb.lol/?lat={OVERVIEW_LAT}&lon={OVERVIEW_LON}&zoom={OVERVIEW_ZOOM}"
-    return _screenshot(map_url, "overview.png", render_wait_ms=6000)
+    map_url = f"https://globe.adsb.lol/?lat={OVERVIEW_LAT}&lon={OVERVIEW_LON}&zoom={OVERVIEW_ZOOM}&hideSidebar"
+    return _screenshot(map_url, "regional_overview.png", render_wait_ms=8000)
 
 def cleanup_file(path):
     if path and os.path.exists(path):
@@ -386,7 +401,7 @@ def cleanup_file(path):
 def send_telegram_media(caption, photo_paths):
     valid = [p for p in photo_paths if p and os.path.exists(p)]
     if not valid:
-        # Fallback to plain text
+        # Plain text message
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": TELEGRAM_CHANNEL_ID, "text": caption, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
         return
@@ -415,6 +430,52 @@ def send_telegram_media(caption, photo_paths):
         finally:
             for fh in opened:
                 fh.close()
+
+# ==================================================================
+# 12-HOUR REGIONAL & IRAN AIRSPACE REPORT
+# ==================================================================
+
+def check_and_send_12h_report(state, valid_flights, mil_flights):
+    last_rep = state.get("last_12h_report_ts")
+    should_send = False
+
+    if last_rep is None:
+        should_send = True
+    else:
+        try:
+            if datetime.fromisoformat(last_rep) <= now_utc() - timedelta(hours=12):
+                should_send = True
+        except Exception:
+            should_send = True
+
+    if not should_send:
+        return
+
+    # Count flights inside Iranian airspace
+    iran_flights = [ac for ac in valid_flights if in_iran_airspace(ac.get("lat"), ac.get("lon"))]
+    civil_hormuz_flights = [ac for ac in valid_flights if in_hormuz_corridor(ac.get("lat"), ac.get("lon"))]
+
+    log(f"[ 12h Report ] Dispatching 12-hour regional report (Monitored: {len(valid_flights)}, Iran Airspace: {len(iran_flights)})...")
+    overview_img = capture_regional_overview_map()
+
+    caption = (
+        f"🌐 <b>12-HOUR REGIONAL & IRAN AIRSPACE BRIEFING</b>\n\n"
+        f"📅 <b>Timestamp:</b> <code>{now_utc().strftime('%Y-%m-%d %H:%M UTC')}</code>\n\n"
+        f"📊 <b>Middle East Total Monitored:</b> <code>{len(valid_flights)}</code>\n"
+        f"🇮🇷 <b>Active in Iranian Airspace:</b> <code>{len(iran_flights)}</code>\n"
+        f"🌊 <b>Hormuz / Persian Gulf Corridor:</b> <code>{len(civil_hormuz_flights)}</code>\n"
+        f"🪖 <b>Monitored Military Aircraft:</b> <code>{len(mil_flights)}</code>\n\n"
+        f"ℹ️ <i>Automated regional surveillance and corridor overview.</i>\n\n"
+        f"🔗 <a href='https://globe.adsb.lol/?lat={OVERVIEW_LAT}&lon={OVERVIEW_LON}&zoom={OVERVIEW_ZOOM}'>Live Regional Radar Map</a>\n"
+        f"📡 @secretollah"
+    )
+
+    try:
+        send_telegram_media(caption, [overview_img] if overview_img else [])
+        state["last_12h_report_ts"] = now_utc().isoformat()
+        log("[ 12h Report ] Successfully sent 12-hour report.")
+    finally:
+        cleanup_file(overview_img)
 
 # ==================================================================
 # MAIN ORCHESTRATION
@@ -449,80 +510,62 @@ def run_tracker():
     state["mil_snapshot_log"].append({"ts": now_utc().isoformat(), "count": len(mil_flights)})
     state["civil_corridor_log"].append({"ts": now_utc().isoformat(), "count": len(civil_hormuz_flights)})
 
-    overview_img = capture_regional_overview_map()
+    # 1. Check and send the dedicated 12-hour regional and Iran airspace briefing
+    check_and_send_12h_report(state, valid_flights, mil_flights)
 
-    try:
-        new_alerts = 0
-        for ac in mil_flights:
-            icao = str(ac.get("hex", "")).strip().lower()
-            callsign = str(ac.get("flight", "N/A")).strip().upper() or "N/A"
-            flight_key = f"{icao}_{callsign}"
+    # 2. Process real-time detections of US/allied military flights
+    new_alerts = 0
+    for ac in mil_flights:
+        icao = str(ac.get("hex", "")).strip().lower()
+        callsign = str(ac.get("flight", "N/A")).strip().upper() or "N/A"
+        flight_key = f"{icao}_{callsign}"
 
-            if not icao or is_recently_seen(state, flight_key):
-                continue
+        if not icao or is_recently_seen(state, flight_key):
+            continue
 
-            mark_seen(state, flight_key)
-            new_alerts += 1
+        mark_seen(state, flight_key)
+        new_alerts += 1
 
-            typecode = str(ac.get("t", "MIL")).strip().upper()
-            model_name = AIRCRAFT_NAMES.get(typecode, f"Military Platform ({typecode})")
-            role = classify_role(typecode)
-            is_us = is_us_military_hex(icao) or any(callsign.startswith(p) for p in US_CALLSIGN_PREFIXES)
-            operator_label = "🇺🇸 US Armed Forces / Air Mobility Command" if is_us else "🪖 Allied / Regional Military"
+        typecode = str(ac.get("t", "MIL")).strip().upper()
+        model_name = AIRCRAFT_NAMES.get(typecode, f"Military Platform ({typecode})")
+        role = classify_role(typecode)
+        is_us = is_us_military_hex(icao) or any(callsign.startswith(p) for p in US_CALLSIGN_PREFIXES)
+        operator_label = "🇺🇸 US Armed Forces / Air Mobility Command" if is_us else "🪖 Allied / Regional Military"
 
-            alt = ac.get("alt_baro", "N/A")
-            spd = ac.get("gs", "N/A")
-            track = ac.get("track")
-            lat, lon = ac.get("lat"), ac.get("lon")
+        alt = ac.get("alt_baro", "N/A")
+        spd = ac.get("gs", "N/A")
+        track = ac.get("track")
+        lat, lon = ac.get("lat"), ac.get("lon")
 
-            posture = determine_movement_posture(track, lat, lon)
-            sector = determine_airspace_sector(lat, lon)
-            photo_url = get_plane_photo(icao)
-            photo_link = f"📸 <a href='{photo_url}'>Spotter Aircraft Photo</a>\n" if photo_url else ""
+        posture = determine_movement_posture(track, lat, lon)
+        sector = determine_airspace_sector(lat, lon)
+        photo_url = get_plane_photo(icao)
+        photo_link = f"📸 <a href='{photo_url}'>Spotter Aircraft Photo</a>\n" if photo_url else ""
 
-            flight_map = capture_flight_map(icao)
+        # Capture ONLY the specific aircraft flight path screenshot
+        flight_map = capture_flight_map(icao)
 
-            caption = (
-                f"🚨 <b>MILITARY FLIGHT DETECTED</b> 🚨\n"
-                f"<b>{model_name}</b>\n"
-                f"🏷️ <b>Operator:</b> {operator_label}\n"
-                f"🎯 <b>Mission Role:</b> <i>{role}</i>\n"
-                f"🧭 <b>Posture:</b> <code>{posture}</code>\n"
-                f"📍 <b>Airspace:</b> <i>{sector}</i>\n\n"
-                f"✈️ <b>Callsign:</b> <code>{callsign}</code>\n"
-                f"🆔 <b>ICAO Hex:</b> <code>{icao.upper()}</code>\n"
-                f"📈 <b>Altitude:</b> <code>{alt} ft</code> | 💨 <b>Speed:</b> <code>{spd} kts</code>\n"
-                f"🗺️ <b>Coords:</b> <code>{lat:.3f}, {lon:.3f}</code>\n\n"
-                f"{photo_link}"
-                f"🔗 <a href='https://globe.adsb.lol/?icao={icao}'>Live Radar Track</a>\n"
-                f"📡 @secretollah"
-            )
+        caption = (
+            f"🚨 <b>MILITARY FLIGHT DETECTED</b> 🚨\n"
+            f"<b>{model_name}</b>\n"
+            f"🏷️ <b>Operator:</b> {operator_label}\n"
+            f"🎯 <b>Mission Role:</b> <i>{role}</i>\n"
+            f"🧭 <b>Posture:</b> <code>{posture}</code>\n"
+            f"📍 <b>Airspace:</b> <i>{sector}</i>\n\n"
+            f"✈️ <b>Callsign:</b> <code>{callsign}</code>\n"
+            f"🆔 <b>ICAO Hex:</b> <code>{icao.upper()}</code>\n"
+            f"📈 <b>Altitude:</b> <code>{alt} ft</code> | 💨 <b>Speed:</b> <code>{spd} kts</code>\n"
+            f"🗺️ <b>Coords:</b> <code>{lat:.3f}, {lon:.3f}</code>\n\n"
+            f"{photo_link}"
+            f"🔗 <a href='https://globe.adsb.lol/?icao={icao}'>Live Radar Track</a>\n"
+            f"📡 @secretollah"
+        )
 
-            photos = [p for p in [overview_img, flight_map] if p]
-            send_telegram_media(caption, photos)
-            cleanup_file(flight_map)
-            log(f"[ Alert Posted ] {callsign} ({icao}) - {model_name}")
-
-        # Routine Heartbeat (only post if no alerts and >2 hours since last heartbeat)
-        if new_alerts == 0:
-            last_hb = state.get("last_fallback_post_ts")
-            should_hb = (last_hb is None or datetime.fromisoformat(last_hb) < now_utc() - timedelta(hours=3))
-            if should_hb and len(valid_flights) > 10:  # Validates that scan was healthy
-                hb_caption = (
-                    f"🌐 <b>REGIONAL AIRSPACE SURVEILLANCE STATUS</b>\n\n"
-                    f"ℹ️ <i>Routine automated scan — Middle East theater.</i>\n"
-                    f"📊 <b>Monitored Aircraft:</b> <code>{len(valid_flights)}</code>\n"
-                    f"🪖 <b>Active Military Tracks:</b> <code>{len(mil_flights)}</code>\n"
-                    f"🌊 <b>Gulf Civilian Corridor:</b> <code>{len(civil_hormuz_flights)}</code>\n\n"
-                    f"🔗 <a href='https://globe.adsb.lol/?lat={OVERVIEW_LAT}&lon={OVERVIEW_LON}&zoom={OVERVIEW_ZOOM}'>Live Regional Map</a>\n"
-                    f"📡 @secretollah"
-                )
-                send_telegram_media(hb_caption, [overview_img] if overview_img else [])
-                state["last_fallback_post_ts"] = now_utc().isoformat()
-                log("[ Heartbeat Posted ] Routine surveillance status broadcasted.")
-
-    finally:
-        cleanup_file(overview_img)
+        # Send ONLY the individual flight screenshot
+        photos = [flight_map] if flight_map else []
+        send_telegram_media(caption, photos)
+        cleanup_file(flight_map)
+        log(f"[ Alert Posted ] {callsign} ({icao}) - {model_name}")
 
     save_state(state)
     log("[ Complete ] Cycle finished.")
