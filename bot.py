@@ -131,7 +131,6 @@ US_LOGISTICS_CALLSIGNS = [
 ]
 
 ISRAEL_CALLSIGNS = ["IAF", "ISF", "ISR", "KNAF", "RAM", "ORON", "EITAM", "SHAVIT"]
-
 ALLIED_MIL_PREFIXES = ["RRR", "ASCOT", "TARTAN", "CTM", "COTAM", "GAF", "GAM", "NATO", "NAF"]
 
 # ==================================================================
@@ -341,17 +340,13 @@ def format_flight_posture(track, lat, lon):
             return "➡️ E. Med Inbound Mideast" if is_eastbound else "⬅️ E. Med Egress"
         return "➡️ Europe Inbound Mideast" if is_eastbound else "⬅️ Europe Westbound Egress"
     else:
-        return "➡️ Theater Inbound" if is_eastbound else ("⬅️ Theater Outbound" if is_westbound else "🔄 Patrol / Refueling Orbit")
+        return "➡️ Theater Inbound" if is_eastbound else ("⬅️ Theater Outbound" if is_westbound else "🔄 Patrol / Orbit")
 
 # ==================================================================
-# ABNORMAL BUILD-UP & EGRESS ANOMALY DETECTION ENGINE
+# ABNORMAL BUILD-UP & EGRESS ANOMALY ENGINE
 # ==================================================================
 
 def evaluate_abnormal_patterns(state, target_flights, civil_hormuz_count):
-    """
-    Evaluates real-time military flight vectors to detect surges, build-ups,
-    mass egress, bomber sorties, and Israeli mobilization.
-    """
     anomalies = []
     evidence_aircraft = []
 
@@ -372,71 +367,60 @@ def evaluate_abnormal_patterns(state, target_flights, civil_hormuz_count):
         is_east = (track is not None and 45 <= track <= 135)
         is_west = (track is not None and 225 <= track <= 315)
 
-        # 1. Bombers (B-52, B-1, B-2)
         if typecode in ["B52", "B1", "B2"] or any(callsign.startswith(p) for p in ["DOOM", "DEATH", "MYTEE", "BONE", "DARK"]):
             bombers.append(ac)
 
-        # 2. Aerial Refueling Tankers
         if typecode in ["KC135", "K35R", "KC46", "KC10", "A332", "B707"] or any(callsign.startswith(p) for p in ["LAGR", "NCHO", "GOLD", "CLEAN", "QUID", "SHELL"]):
             tankers.append(ac)
 
-        # 3. Heavy Transports
         if typecode in ["C17", "C5", "C130", "C30J", "A400", "AN124", "IL76"] or any(callsign.startswith(p) for p in ["RCH", "REACH", "MOOSE", "SLAM", "CMB"]):
             if is_east or (lon and lon > 20.0 and is_east):
                 inbound_airlift.append(ac)
             elif is_west and (lon and lon > 15.0):
                 outbound_airlift.append(ac)
 
-        # 4. Israeli Strategic Assets
         if is_israeli_military(icao, callsign) or typecode in ["G550", "GLF5", "B707", "B767"]:
             israeli_strategic.append(ac)
 
-        # 5. Doomsday / High-Value Command
         if typecode in ["E4B", "VC25", "C32", "E6B"]:
             doomsday_vip.append(ac)
 
-    # RULE 1: Strategic Bomber Airborne in Pipeline / Theater
+    # Threshold rules
     if bombers:
-        anomalies.append(f"💣 <b>STRATEGIC BOMBER SORTIE:</b> {len(bombers)} US Heavy Bomber(s) active airborne.")
+        anomalies.append(f"💣 <b>STRATEGIC BOMBERS ACTIVE:</b> {len(bombers)} Heavy Bomber(s) airborne.")
         evidence_aircraft.extend(bombers)
 
-    # RULE 2: Massive US Inbound Airlift Surge (Build-Up)
     if len(inbound_airlift) >= 3:
-        anomalies.append(f"📦 <b>MASS AIR MOBILITY BUILD-UP:</b> {len(inbound_airlift)} Strategic Transports inbound to Mideast pipeline simultaneously.")
+        anomalies.append(f"📦 <b>MASS AIRLIFT BUILD-UP:</b> {len(inbound_airlift)} Transports inbound to Mideast.")
         evidence_aircraft.extend(inbound_airlift)
 
-    # RULE 3: Massive US Outbound Egress (Departure / Drawdown)
     if len(outbound_airlift) >= 3:
-        anomalies.append(f"🛫 <b>THEATER EGRESS SURGE:</b> {len(outbound_airlift)} Military Transports heading Westbound out of Mideast theater at once.")
+        anomalies.append(f"🛫 <b>THEATER EGRESS SURGE:</b> {len(outbound_airlift)} Military Transports heading Westbound.")
         evidence_aircraft.extend(outbound_airlift)
 
-    # RULE 4: Tanker Strike Bridge / Package Posture
     if len(tankers) >= 4:
-        anomalies.append(f"⛽ <b>AERIAL REFUELING SURGE:</b> {len(tankers)} Tankers active along corridor (Strike escort / Air Bridge posture).")
+        anomalies.append(f"⛽ <b>AERIAL REFUELING SURGE:</b> {len(tankers)} Tankers active along corridor.")
         evidence_aircraft.extend(tankers)
 
-    # RULE 5: Israeli Air Force Strategic Mobilization
     if len(israeli_strategic) >= 2:
-        anomalies.append(f"🇮🇱 <b>ISRAELI AIR FORCE MOBILIZATION:</b> {len(israeli_strategic)} Strategic IAF assets active (Tankers / G550 AEW&C / Transports).")
+        anomalies.append(f"🇮🇱 <b>ISRAELI AIR FORCE SURGE:</b> {len(israeli_strategic)} Strategic IAF assets active.")
         evidence_aircraft.extend(israeli_strategic)
 
-    # RULE 6: Doomsday / National Airborne Command Post
     if doomsday_vip:
-        anomalies.append(f"🚨 <b>NATIONAL AIRBORNE COMMAND ACTIVE:</b> High-value US command aircraft airborne.")
+        anomalies.append(f"🚨 <b>NATIONAL AIRBORNE COMMAND:</b> High-value US command aircraft airborne.")
         evidence_aircraft.extend(doomsday_vip)
 
-    # RULE 7: Commercial Airline Avoidance of Hormuz Corridor
     one_hour_ago = now_utc() - timedelta(hours=1)
     civil_baseline_counts = [s["count"] for s in state.get("civil_corridor_log", []) if datetime.fromisoformat(s["ts"]) <= one_hour_ago]
     civil_baseline = (sum(civil_baseline_counts) / len(civil_baseline_counts)) if civil_baseline_counts else 0
 
     if civil_baseline >= 8 and civil_hormuz_count <= civil_baseline * 0.4:
-        anomalies.append(f"⚠️ <b>HORMUZ AIR CORRIDOR DROP:</b> Civilian traffic dropped to {civil_hormuz_count} flights (vs normal baseline ~{civil_baseline:.1f}). Possible airspace avoidance.")
+        anomalies.append(f"⚠️ <b>HORMUZ TRAFFIC DROP:</b> Commercial traffic dropped to {civil_hormuz_count} flights (baseline ~{civil_baseline:.1f}).")
 
     return anomalies, evidence_aircraft
 
 # ==================================================================
-# SCREENSHOT CAPTURE (Uses domcontentloaded to prevent timeouts)
+# SCREENSHOT CAPTURE (Isolates ALL Cumulative Flights on the Map)
 # ==================================================================
 
 def _screenshot(map_url: str, filename: str, render_wait_ms: int = 8000):
@@ -470,9 +454,24 @@ def _screenshot(map_url: str, filename: str, render_wait_ms: int = 8000):
         log(f"[ Warn ] Screenshot failed: {e}")
         return None
 
-def capture_cumulative_military_map() -> str:
-    map_url = f"https://globe.adsb.lol/?lat={CUMULATIVE_MAP_LAT}&lon={CUMULATIVE_MAP_LON}&zoom={CUMULATIVE_MAP_ZOOM}&filterMil&hideSidebar"
-    return _screenshot(map_url, "cumulative_pipeline.png", render_wait_ms=8000)
+def capture_cumulative_flights_map(ac_list: list) -> str:
+    """
+    CRITICAL FEATURE:
+    Passes comma-separated hex IDs of ALL detected cumulative flights into tar1090.
+    - icaoFilter: isolates ONLY these aircraft on the map (all other traffic hidden).
+    - icao: selects them to display their flight track lines.
+    - enableLabels: prints callsigns and types directly next to each plane icon.
+    """
+    hexes = [str(ac.get("hex", "")).strip().lower() for ac in ac_list if ac.get("hex")]
+    hex_str = ",".join(hexes[:30])
+
+    if hex_str:
+        map_url = f"https://globe.adsb.lol/?icaoFilter={hex_str}&icao={hex_str}&enableLabels&hideSidebar"
+    else:
+        map_url = f"https://globe.adsb.lol/?lat={CUMULATIVE_MAP_LAT}&lon={CUMULATIVE_MAP_LON}&zoom={CUMULATIVE_MAP_ZOOM}&filterMil&hideSidebar"
+
+    log(f"[ Playwright ] Capturing cumulative map for {len(hexes)} isolated flights...")
+    return _screenshot(map_url, "cumulative_flights.png", render_wait_ms=8500)
 
 def capture_regional_overview_map() -> str:
     map_url = f"https://globe.adsb.lol/?lat={OVERVIEW_LAT}&lon={OVERVIEW_LON}&zoom={OVERVIEW_ZOOM}&hideSidebar"
@@ -486,34 +485,37 @@ def cleanup_file(path):
             pass
 
 # ==================================================================
-# TELEGRAM DISPATCH
+# TELEGRAM DISPATCH (Screenshot with Report in Caption)
 # ==================================================================
 
 def send_telegram_alert(caption: str, photo_path: str):
+    """
+    Ensures the report is ALWAYS attached as the caption of the screenshot.
+    Truncates to 1020 chars if needed so Telegram's 1024-character photo caption
+    limit is never exceeded.
+    """
+    if len(caption) > 1024:
+        caption = caption[:1020] + "..."
+
     if photo_path and os.path.exists(photo_path) and os.path.getsize(photo_path) > 0:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
         try:
-            photo_caption = caption if len(caption) <= 1024 else caption[:1000] + "\n<i>[Full details below...]</i>"
             with open(photo_path, "rb") as f:
                 res = requests.post(
                     url,
-                    data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": photo_caption, "parse_mode": "HTML"},
+                    data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"},
                     files={"photo": f},
-                    timeout=30,
+                    timeout=35,
                 ).json()
             if res.get("ok"):
-                log(f"[ Telegram ] Photo dispatch delivered.")
-                if len(caption) > 1024:
-                    time.sleep(1)
-                    requests.post(
-                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                        data={"chat_id": TELEGRAM_CHANNEL_ID, "text": caption, "parse_mode": "HTML", "disable_web_page_preview": True},
-                        timeout=15,
-                    )
+                log(f"[ Telegram ] Photo with report caption delivered successfully.")
                 return True
+            else:
+                log(f"[ Telegram Warn ] sendPhoto rejected: {res}. Falling back to text.")
         except Exception as e:
             log(f"[ Telegram Error ] sendPhoto failed: {e}")
 
+    # Fallback to plain text if photo fails
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": TELEGRAM_CHANNEL_ID, "text": caption, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
@@ -600,7 +602,7 @@ def run_tracker():
     # 1. Dispatch independent 12-hour Regional & Iran airspace briefing
     check_and_send_12h_report(state, raw_aircraft)
 
-    # 2. REAL-TIME ANOMALY & BUILD-UP / EGRESS DETECTION (Dispatches immediately outside 12h schedule)
+    # 2. REAL-TIME ANOMALY & BUILD-UP / EGRESS DETECTION
     anomalies, evidence_aircraft = evaluate_abnormal_patterns(state, target_flights, len(civil_hormuz_flights))
 
     if anomalies:
@@ -617,26 +619,26 @@ def run_tracker():
 
         if should_post_anomaly:
             log(f"[ FLASH ALERT ] Anomaly detected: {anomalies}")
-            anomaly_map = capture_cumulative_military_map()
+            # Screenshot isolates the exact evidence aircraft
+            anomaly_map = capture_cumulative_flights_map(evidence_aircraft)
 
             anomaly_lines = [
                 f"🚨 <b>STRATEGIC MILITARY ANOMALY ALERT</b> 🚨",
-                f"⚠️ <b>Abnormal Build-Up / Movement Detected</b>",
+                f"⚠️ <b>Abnormal Build-Up / Egress Vector</b>",
                 f"⏱ <b>Timestamp:</b> <code>{now_utc().strftime('%Y-%m-%d %H:%M UTC')}</code>\n",
-                f"<b>Contributing Factors:</b>"
+                f"<b>Key Indicators:</b>"
             ]
-            for factor in anomalies:
+            for factor in anomalies[:4]:
                 anomaly_lines.append(f"• {factor}")
 
-            anomaly_lines.append("\n<b>Key Assets Observed:</b>")
+            anomaly_lines.append("\n<b>Observed Surge Assets:</b>")
             dedup_ev = {str(ac.get("hex", "")).lower(): ac for ac in evidence_aircraft}
             for ac in list(dedup_ev.values())[:6]:
                 callsign = str(ac.get("flight", "N/A")).strip().upper() or "N/A"
                 typecode = str(ac.get("t", "MIL")).strip().upper()
-                model = AIRCRAFT_NAMES.get(typecode, typecode)
-                alt = ac.get("alt_baro", "N/A")
+                alt = f"{ac.get('alt_baro', 'N/A')} ft" if ac.get('alt_baro') else "N/A"
                 posture = format_flight_posture(ac.get("track"), ac.get("lat"), ac.get("lon"))
-                anomaly_lines.append(f"• <code>{callsign}</code> ({model}) | {posture} | <code>{alt} ft</code>")
+                anomaly_lines.append(f"• <code>{callsign}</code> ({typecode}) | {alt} | {posture}")
 
             anomaly_lines.append("\n🔗 <a href='https://globe.adsb.lol/?filterMil'>Live Military Radar Feed</a>")
             anomaly_lines.append("📡 @secretollah")
@@ -647,9 +649,9 @@ def run_tracker():
 
             state["last_anomaly_sig"] = current_sig
             state["last_anomaly_ts"] = now_utc().isoformat()
-            log("[ FLASH ALERT ] Delivered urgent anomaly alert to Telegram.")
+            log("[ FLASH ALERT ] Delivered urgent anomaly alert with attached screenshot.")
 
-    # 3. ROUTINE CUMULATIVE DIGEST (Dispatches when newly detected flights arrive along the pipeline)
+    # 3. ROUTINE CUMULATIVE DIGEST (Batches all cumulative flights into ONE report + screenshot)
     new_flights = []
     for ac in target_flights:
         icao = str(ac.get("hex", "")).strip().lower()
@@ -664,10 +666,10 @@ def run_tracker():
 
     log(f"[ Activity ] {len(target_flights)} active military flights ({len(new_flights)} new arrivals).")
 
-    # Only post routine digest if new flights appeared and no anomaly was just posted in this cycle
+    # Only post routine digest if new flights appeared and no anomaly was just posted
     if len(new_flights) > 0 and not anomalies:
-        log("[ Screenshot ] Capturing cumulative military situation map...")
-        cumulative_map = capture_cumulative_military_map()
+        # Screenshot isolates ALL currently active target flights on the map with callsign labels
+        cumulative_map = capture_cumulative_flights_map(target_flights)
 
         groups = {"transatlantic": [], "europe": [], "mideast": []}
         for ac in target_flights:
@@ -676,40 +678,46 @@ def run_tracker():
             groups[g].append(ac)
 
         lines = [
-            f"🚨 <b>US & ALLIED MILITARY LOGISTICS PIPELINE</b> 🚨",
-            f"⏱ <b>Active Snapshot:</b> <code>{now_utc().strftime('%Y-%m-%d %H:%M UTC')}</code>",
-            f"✈️ <b>Total Airborne Assets:</b> <code>{len(target_flights)}</code> (<code>+{len(new_flights)} new</code>)\n"
+            f"🚨 <b>US & ALLIED MILITARY AIR MOBILITY</b> 🚨",
+            f"⏱ <b>Active Fleet Snapshot:</b> <code>{now_utc().strftime('%Y-%m-%d %H:%M UTC')}</code>",
+            f"✈️ <b>Total Airborne:</b> <code>{len(target_flights)}</code> (<code>+{len(new_flights)} new</code>)\n"
         ]
 
         new_hexes = {str(ac.get("hex", "")).lower() for ac in new_flights}
+        rendered_count = 0
 
         def render_group(header, ac_list):
+            nonlocal rendered_count
             if not ac_list:
                 return
             lines.append(f"<b>{header}</b>")
-            for ac in ac_list[:8]:
+            for ac in ac_list:
+                if rendered_count >= 10:
+                    break
                 hex_code = str(ac.get("hex", "")).lower()
                 callsign = str(ac.get("flight", "N/A")).strip().upper() or "N/A"
                 typecode = str(ac.get("t", "MIL")).strip().upper()
-                model = AIRCRAFT_NAMES.get(typecode, typecode)
-                alt = ac.get("alt_baro", "N/A")
+                alt = f"{ac.get('alt_baro', 'N/A')} ft" if ac.get('alt_baro') else "N/A"
                 posture = format_flight_posture(ac.get("track"), ac.get("lat"), ac.get("lon"))
                 new_badge = " 🆕" if hex_code in new_hexes else ""
 
-                lines.append(f"• <code>{callsign}</code> ({model}){new_badge}")
-                lines.append(f"  └ <i>{posture}</i> | <code>{alt} ft</code>")
-            if len(ac_list) > 8:
-                lines.append(f"  <i>...and {len(ac_list) - 8} more flights</i>")
+                lines.append(f"• <code>{callsign}</code> ({typecode}) | {alt} | {posture}{new_badge}")
+                rendered_count += 1
             lines.append("")
 
-        render_group("🌊 TRANSATLANTIC AIR BRIDGE & CONUS:", groups["transatlantic"])
-        render_group("🇪🇺 EUROPEAN TRANSIT CORRIDORS:", groups["europe"])
+        render_group("🌊 TRANSATLANTIC & CONUS:", groups["transatlantic"])
+        render_group("🇪🇺 EUROPEAN CORRIDORS:", groups["europe"])
         render_group("🌐 MIDDLE EAST FORWARD THEATER:", groups["mideast"])
+
+        remaining = len(target_flights) - rendered_count
+        if remaining > 0:
+            lines.append(f"<i>...and {remaining} more active aircraft on radar</i>\n")
 
         lines.append("🔗 <a href='https://globe.adsb.lol/?filterMil'>Live Military Radar Feed</a>")
         lines.append("📡 @secretollah")
 
         caption = "\n".join(lines)
+        # SENDS THE SCREENSHOT OF ALL CUMULATIVE FLIGHTS WITH REPORT IN CAPTION
         send_telegram_alert(caption, cumulative_map)
         cleanup_file(cumulative_map)
         log("[ Digest Delivered ] Cumulative military fleet dispatch posted successfully.")
