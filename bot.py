@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import re
 import hashlib
 import traceback
 from datetime import datetime, timezone, timedelta
@@ -128,10 +129,7 @@ US_LOGISTICS_CALLSIGNS = [
     "NAVY", "TOPCAT", "VNDL", "GOTO", "PAT", "EVAC", "SAM", "EXEC", "SPAR", "VENUS",
 ]
 
-# STRICT Israeli military prefixes ONLY (civilian airlines completely excluded)
 ISRAEL_MIL_PREFIXES = ["IAF", "ISF", "KNAF", "ISR01", "EITAM", "SHAVIT", "ORON"]
-
-# Civilian airline calls to explicitly reject
 CIVILIAN_EXCLUDE_PREFIXES = ["ELY", "ISR", "IZ", "AIZ", "RAM", "THY", "SVA", "QTR", "UAE", "ETD", "MSR"]
 
 # ==================================================================
@@ -148,7 +146,7 @@ def get_country_operator(ac: dict) -> tuple:
     except Exception:
         val = 0
 
-    # 1. Israel Air Force (Strict check - no civilian airliners)
+    # 1. Israel Air Force
     if any(cs.startswith(p) for p in ISRAEL_MIL_PREFIXES):
         return "🇮🇱", "Israeli Air Force"
     if 0x738000 <= val <= 0x738FFF and db_flags == 1:
@@ -292,7 +290,7 @@ def fetch_from_opensky():
     auth = (OPENSKY_USER, OPENSKY_PASS) if (OPENSKY_USER and OPENSKY_PASS) else None
     url = f"https://opensky-network.org/api/states/all?lamin={MIDEAST_LAT_MIN}&lomin={MIDEAST_LON_MIN}&lamax={MIDEAST_LAT_MAX}&lomax={MIDEAST_LON_MAX}"
     try:
-        res = requests.get(url, headers={"User-Agent": "MilitaryTracker/7.0"}, auth=auth, timeout=15)
+        res = requests.get(url, headers={"User-Agent": "MilitaryTracker/8.0"}, auth=auth, timeout=15)
         if res.status_code == 200:
             states = res.json().get("states", []) or []
             log(f"[ OpenSky ] Fallback returned {len(states)} regional aircraft.")
@@ -481,7 +479,6 @@ def calculate_escalation_score(state, target_flights, civil_hormuz_count):
         if typecode in ["E4B", "VC25", "C32", "E6B"]:
             doomsday_vip.append(ac)
 
-    # Risk factors
     if bombers:
         score += 35
         factors.append(f"💣 Strategic Bombers Active ({len(bombers)} B-52/B-1/B-2)")
@@ -586,7 +583,7 @@ def _screenshot(map_url: str, filename: str, render_wait_ms: int = 9000):
             page.goto(map_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(render_wait_ms)
 
-            # CRITICAL: Trigger selectAllPlanes() so tar1090 downloads and draws full breadcrumb trails
+            # Trigger selectAllPlanes() and fetchTrack() to paint colored trail lines
             page.evaluate('''() => {
                 try {
                     if (typeof selectAllPlanes === 'function') {
@@ -598,7 +595,6 @@ def _screenshot(map_url: str, filename: str, render_wait_ms: int = 9000):
                             }
                         }
                     }
-                    // Hide sidebars and control buttons cleanly
                     const sb = document.getElementById('sidebar');
                     if (sb) sb.style.display = 'none';
                     const info = document.getElementById('selected_infoblock');
@@ -609,7 +605,6 @@ def _screenshot(map_url: str, filename: str, render_wait_ms: int = 9000):
                 } catch(e) {}
             }''')
 
-            # Wait 4 seconds for track network requests and vector lines to paint on canvas
             page.wait_for_timeout(4000)
             page.screenshot(path=filename, full_page=False)
             browser.close()
@@ -627,9 +622,6 @@ def capture_cumulative_flights_map(ac_list: list) -> str:
     hex_str = ",".join(hexes[:30])
     center_lat, center_lon, zoom = calculate_wide_view(ac_list)
 
-    # nowebgl forces HTML5 2D Canvas so satellite tiles render without Linux GPU crashes
-    # baseMap=esri loads ArcGIS satellite imagery displaying continents and oceans
-    # enableLabels renders clean single-line callsigns without multi-line clutter
     if hex_str:
         map_url = (
             f"https://globe.adsb.lol/?icaoFilter={hex_str}&lat={center_lat}&lon={center_lon}&zoom={zoom}"
@@ -653,13 +645,19 @@ def cleanup_file(path):
             pass
 
 # ==================================================================
-# TELEGRAM DISPATCH (Photo with Report in Caption)
+# TELEGRAM DISPATCH (Safe HTML + Tag-Preserving Fallback)
 # ==================================================================
 
-def send_telegram_alert(caption: str, photo_path: str):
-    if len(caption) > 1024:
-        caption = caption[:1020] + "..."
+def strip_html_tags(text: str) -> str:
+    """Safely strips HTML tags if Telegram entity parsing fails."""
+    return re.sub(r'<[^>]+>', '', text)
 
+def send_telegram_alert(caption: str, photo_path: str):
+    """
+    Delivers photo with report attached directly in caption.
+    Includes robust fallback: if Telegram rejects HTML entities, it immediately
+    retries without HTML tags to ensure the alert is never lost.
+    """
     if photo_path and os.path.exists(photo_path) and os.path.getsize(photo_path) > 0:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
         try:
@@ -670,17 +668,32 @@ def send_telegram_alert(caption: str, photo_path: str):
                     files={"photo": f},
                     timeout=35,
                 ).json()
+
             if res.get("ok"):
-                log(f"[ Telegram ] Photo report delivered successfully.")
+                log("[ Telegram ] Photo report delivered successfully.")
                 return True
             else:
-                log(f"[ Telegram Warn ] sendPhoto rejected: {res}. Falling back to text.")
+                log(f"[ Telegram Warn ] sendPhoto rejected: {res}. Retrying without HTML tags...")
+                # Retry sendPhoto as plain text (eliminates any unclosed tag / parse errors)
+                with open(photo_path, "rb") as f:
+                    res_retry = requests.post(
+                        url,
+                        data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": strip_html_tags(caption)[:1020]},
+                        files={"photo": f},
+                        timeout=35,
+                    ).json()
+                if res_retry.get("ok"):
+                    log("[ Telegram ] Photo report delivered via plain text fallback.")
+                    return True
         except Exception as e:
             log(f"[ Telegram Error ] sendPhoto failed: {e}")
 
+    # Fallback to plain text message
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHANNEL_ID, "text": caption, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
+        res = requests.post(url, data={"chat_id": TELEGRAM_CHANNEL_ID, "text": caption, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15).json()
+        if not res.get("ok"):
+            requests.post(url, data={"chat_id": TELEGRAM_CHANNEL_ID, "text": strip_html_tags(caption)}, timeout=15)
         return True
     except Exception as e:
         log(f"[ Telegram Error ] sendMessage failed: {e}")
@@ -711,7 +724,7 @@ def check_and_send_12h_report(state, raw_aircraft):
     hormuz_flights = [ac for ac in raw_aircraft if in_hormuz_corridor(ac.get("lat"), ac.get("lon"))]
     mil_in_mideast = [ac for ac in mideast_flights if is_target_flight(ac)]
 
-    log(f"[ 12h Report ] Dispatching 12-hour report...")
+    log("[ 12h Report ] Dispatching 12-hour report...")
     overview_img = capture_regional_overview_map()
 
     caption = (
@@ -786,28 +799,37 @@ def run_tracker():
             routes = lookup_flight_routes(evidence_aircraft if evidence_aircraft else target_flights)
 
             anomaly_lines = [
-                f"🚨 <b>MILITARY BUILD-UP & WAR THREAT ESCALATION</b> 🚨",
+                "🚨 <b>MILITARY BUILD-UP & WAR THREAT ESCALATION</b> 🚨",
                 f"{emoji} <b>WAR READINESS INDEX:</b> <code>{score}/100 ({level})</code>",
                 f"⏱ <b>Timestamp:</b> <code>{now_utc().strftime('%Y-%m-%d %H:%M UTC')}</code>\n",
-                f"<b>Critical Buildup Factors:</b>"
+                "<b>Critical Buildup Factors:</b>"
             ]
-            for factor in factors:
+            for factor in factors[:3]:
                 anomaly_lines.append(f"• {factor}")
 
             anomaly_lines.append("\n<b>Key Identified Assets:</b>")
             dedup_ev = {str(ac.get("hex", "")).lower(): ac for ac in (evidence_aircraft or target_flights)}
-            for ac in list(dedup_ev.values())[:6]:
+            
+            # Safe length budgeting for flash alerts
+            footer = "\n🔗 <a href='https://globe.adsb.lol/?filterMil&baseMap=esri'>Live Military Radar Feed</a>\n📡 @secretollah"
+            for ac in list(dedup_ev.values()):
                 flag, operator = get_country_operator(ac)
                 callsign = str(ac.get("flight", "N/A")).strip().upper() or "N/A"
                 typecode = str(ac.get("t", "MIL")).strip().upper()
                 alt = f"{ac.get('alt_baro', 'N/A')} ft" if ac.get('alt_baro') else "N/A"
                 dest_info = routes.get(callsign) or format_flight_posture(ac.get("track"), ac.get("lat"), ac.get("lon"))
-                anomaly_lines.append(f"• {flag} <b>{operator}</b> | <code>{callsign}</code> ({typecode}) | {alt}\n  └ 🎯 <b>Dest:</b> <code>{dest_info}</code>")
+                entry = f"• {flag} <b>{operator}</b> | <code>{callsign}</code> ({typecode}) | {alt}\n  └ 🎯 <b>Dest:</b> <code>{dest_info}</code>"
+                
+                # Check character limit before appending
+                test_len = len("\n".join(anomaly_lines + [entry, footer]))
+                if test_len > 980:
+                    anomaly_lines.append(f"<i>...and {len(dedup_ev) - len(anomaly_lines) + 4} more assets</i>")
+                    break
+                anomaly_lines.append(entry)
 
-            anomaly_lines.append("\n🔗 <a href='https://globe.adsb.lol/?filterMil&baseMap=esri'>Live Military Radar Feed</a>")
-            anomaly_lines.append("📡 @secretollah")
-
+            anomaly_lines.append(footer)
             anomaly_caption = "\n".join(anomaly_lines)
+
             send_telegram_alert(anomaly_caption, anomaly_map)
             cleanup_file(anomaly_map)
 
@@ -834,18 +856,19 @@ def run_tracker():
         cumulative_map = capture_cumulative_flights_map(target_flights)
         routes = lookup_flight_routes(target_flights)
 
-        lines = [
-            f"🚨 <b>STRATEGIC MILITARY AIR MOBILITY</b> 🚨",
+        header_lines = [
+            "🚨 <b>US & ALLIED STRATEGIC AIR MOBILITY</b> 🚨",
             f"{emoji} <b>War Escalation Index:</b> <code>{score}/100 ({level})</code>",
             f"⏱ <b>Active Fleet:</b> <code>{now_utc().strftime('%Y-%m-%d %H:%M UTC')}</code> | ✈️ <code>{len(target_flights)} active (+{len(new_flights)} new)</code>\n"
         ]
+        footer = "\n🔗 <a href='https://globe.adsb.lol/?filterMil&baseMap=esri'>Live Military Radar Feed</a>\n📡 @secretollah"
 
         new_hexes = {str(ac.get("hex", "")).lower() for ac in new_flights}
+        flight_entries = []
         rendered_count = 0
 
+        # Build lines safely without ever slicing tags
         for ac in target_flights:
-            if rendered_count >= 8:
-                break
             hex_code = str(ac.get("hex", "")).lower()
             flag, operator = get_country_operator(ac)
             callsign = str(ac.get("flight", "N/A")).strip().upper() or "N/A"
@@ -854,18 +877,22 @@ def run_tracker():
             dest_info = routes.get(callsign) or format_flight_posture(ac.get("track"), ac.get("lat"), ac.get("lon"))
             new_badge = " 🆕" if hex_code in new_hexes else ""
 
-            lines.append(f"• {flag} <b>{operator}</b> | <code>{callsign}</code> ({typecode}) | {alt}{new_badge}")
-            lines.append(f"  └ 🎯 <b>Dest:</b> <code>{dest_info}</code>")
+            entry = (
+                f"• {flag} <b>{operator}</b> | <code>{callsign}</code> ({typecode}) | {alt}{new_badge}\n"
+                f"  └ 🎯 <b>Dest:</b> <code>{dest_info}</code>"
+            )
+
+            # Strict character budgeting: stop adding items before 950 characters
+            current_total = len("\n".join(header_lines + flight_entries + [entry, footer]))
+            if current_total > 950:
+                remaining = len(target_flights) - rendered_count
+                flight_entries.append(f"<i>...and {remaining} more active aircraft on radar</i>")
+                break
+
+            flight_entries.append(entry)
             rendered_count += 1
 
-        remaining = len(target_flights) - rendered_count
-        if remaining > 0:
-            lines.append(f"\n<i>...and {remaining} more active aircraft on radar</i>")
-
-        lines.append("\n🔗 <a href='https://globe.adsb.lol/?filterMil&baseMap=esri'>Live Military Radar Feed</a>")
-        lines.append("📡 @secretollah")
-
-        caption = "\n".join(lines)
+        caption = "\n".join(header_lines + flight_entries + [footer])
         send_telegram_alert(caption, cumulative_map)
         cleanup_file(cumulative_map)
         log("[ Digest Delivered ] Clean overview map with flight path graphics and country flags delivered.")
