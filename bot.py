@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import math
 import traceback
 from datetime import datetime, timezone, timedelta
 
@@ -8,54 +9,44 @@ import requests
 from playwright.sync_api import sync_playwright
 
 # ==================================================================
-# CONFIG
+# CONFIG & SECRETS (Safe for public GitHub repo)
 # ==================================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
-# Regional bounding box -- Iran, the Gulf Arab states, Iraq, and Israel/Levant
-LAT_MIN, LAT_MAX = 16.0, 39.0
+# Optional OpenSky credentials (can be added as GitHub Secrets if available)
+OPENSKY_USER = os.getenv("OPENSKY_USER")
+OPENSKY_PASS = os.getenv("OPENSKY_PASS")
+
+# Regional bounding box: Eastern Mediterranean, Levant, Iraq, Iran, Gulf, Red Sea
+LAT_MIN, LAT_MAX = 15.0, 39.0
 LON_MIN, LON_MAX = 32.0, 63.0
 
-# Grid of search points tiling the region (each point-search call only
-# covers a ~250nm radius circle)
+# Strategic points covering key choke points, logistics hubs & corridors
 REGION_POINTS = [
-    ("Tehran / Central Iran", 35.7, 51.4),
+    ("Al Udeid / Persian Gulf / Qatar", 25.1, 51.3),
     ("Strait of Hormuz / S. Iran", 26.5, 56.0),
-    ("SW Iran / N. Persian Gulf", 30.0, 49.0),
-    ("E. Iran", 32.0, 60.5),
-    ("Saudi Arabia / Eastern Province", 26.0, 50.0),
-    ("UAE / Qatar / Bahrain", 25.0, 54.0),
-    ("Kuwait", 29.3, 47.9),
-    ("Oman / S. Hormuz approach", 23.5, 58.5),
-    ("Iraq", 33.3, 44.4),
-    ("Israel / Levant", 31.5, 35.0),
+    ("Al Dhafra / UAE", 24.2, 54.5),
+    ("Ali Al Salem / Kuwait / N. Gulf", 29.3, 47.5),
+    ("Prince Sultan AB / Saudi Arabia", 24.1, 47.6),
+    ("Iraq / Syria Border / Levant", 33.5, 42.0),
+    ("Israel / Jordan / E. Med", 31.8, 35.2),
+    ("Bab el-Mandeb / S. Red Sea", 13.0, 43.5),
+    ("Tehran / Central Iran", 35.7, 51.4),
+    ("Oman / Arabian Sea Approach", 23.5, 58.5),
 ]
 POINT_RADIUS_NM = 250
 
-# Sub-box used for the civilian "mass diversion" anomaly baseline --
-# the Hormuz / Iranian Gulf corridor, the highest-signal area for
-# airlines quietly rerouting away from Iranian airspace.
 HORMUZ_LAT_MIN, HORMUZ_LAT_MAX = 24.0, 30.0
 HORMUZ_LON_MIN, HORMUZ_LON_MAX = 53.0, 60.0
 
-# Center point / zoom used for the regional overview screenshot --
-# widened to fit Israel through eastern Iran in one frame
-OVERVIEW_LAT, OVERVIEW_LON, OVERVIEW_ZOOM = 28.0, 48.0, 5
-
+OVERVIEW_LAT, OVERVIEW_LON, OVERVIEW_ZOOM = 27.5, 47.0, 5
 STATE_FILE = "state.json"
-LEGACY_STATE_FILE = "seen_flights.json"  # from the old version of this bot
-
-# How long a given aircraft can go "unseen" before it's eligible to be
-# re-announced (prevents a loitering aircraft from re-alerting every
-# 10 minutes, while still allowing a repeat appearance days later).
 REANNOUNCE_AFTER_HOURS = 8
-
 
 def log(msg):
     print(msg, flush=True)
-
 
 now_utc = lambda: datetime.now(timezone.utc)
 
@@ -64,42 +55,75 @@ now_utc = lambda: datetime.now(timezone.utc)
 # ==================================================================
 
 AIRCRAFT_NAMES = {
-    "C17": "C-17A Globemaster III", "C130": "C-130 Hercules", "C30J": "C-130J Super Hercules",
-    "C5": "C-5M Super Galaxy", "K35R": "KC-135 Stratotanker", "KC135": "KC-135 Stratotanker",
-    "KC10": "KC-10 Extender", "KC46": "KC-46 Pegasus", "A332": "A330 MRTT Tanker",
-    "A400": "A400M Atlas", "P8": "P-8A Poseidon ISR", "RC135": "RC-135 Rivet Joint",
-    "E3TF": "E-3 Sentry AWACS", "E3": "E-3 Sentry AWACS", "E8": "E-8 Joint STARS",
-    "E2": "E-2 Hawkeye", "IL76": "Ilyushin Il-76 Cargo", "AN124": "Antonov An-124 Heavy Cargo",
-    "RQ4": "RQ-4 Global Hawk Drone", "MQ9": "MQ-9 Reaper Drone", "VC25": "Air Force One (VC-25)",
-    "C32": "Boeing C-32 VIP", "C40": "Boeing C-40 Clipper",
-    "B52": "B-52H Stratofortress", "B1": "B-1B Lancer", "B2": "B-2 Spirit",
-    "F15": "F-15 Eagle/Strike Eagle", "F16": "F-16 Fighting Falcon", "F22": "F-22 Raptor",
-    "F35": "F-35 Lightning II", "F18": "F/A-18 Hornet", "A10": "A-10 Thunderbolt II",
+    # Strategic Airlift / Heavy Cargo
+    "C17": "C-17A Globemaster III (Strategic Airlifter)",
+    "C5": "C-5M Super Galaxy (Heavy Airlifter)",
+    "C130": "C-130 Hercules (Tactical Transport)",
+    "C30J": "C-130J Super Hercules",
+    "A400": "A400M Atlas (Heavy Transport)",
+    "IL76": "Ilyushin Il-76 (Strategic Transport)",
+    "AN124": "Antonov An-124 Ruslan",
+    # Aerial Refueling Tankers
+    "KC135": "KC-135R Stratotanker",
+    "K35R": "KC-135R Stratotanker",
+    "KC46": "KC-46A Pegasus",
+    "KC10": "KC-10A Extender",
+    "A332": "A330 MRTT (Multi-Role Tanker)",
+    # ISR, Reconnaissance & Airborne Command
+    "P8": "P-8A Poseidon (Maritime Recon/ASW)",
+    "RC135": "RC-135 Rivet Joint / Combat Sent (SIGINT)",
+    "E3TF": "E-3 Sentry (AWACS Command)",
+    "E3": "E-3 Sentry (AWACS Command)",
+    "E8": "E-8C Joint STARS (Ground Surveillance)",
+    "E2": "E-2D Advanced Hawkeye (Carrier AEW)",
+    "RQ4": "RQ-4 Global Hawk / MQ-4C Triton (HALE Drone)",
+    "MQ9": "MQ-9 Reaper (Armed Recon Drone)",
+    "U2": "U-2S Dragon Lady (High Altitude Recon)",
+    # Combat & Strike
+    "B52": "B-52H Stratofortress",
+    "B1": "B-1B Lancer",
+    "B2": "B-2A Spirit (Stealth Bomber)",
+    "F15": "F-15 Strike Eagle",
+    "F16": "F-16 Fighting Falcon",
+    "F22": "F-22A Raptor",
+    "F35": "F-35 Lightning II",
+    "F18": "F/A-18 Super Hornet",
+    "A10": "A-10C Thunderbolt II",
+    # Executive / Command
+    "VC25": "Air Force One (VC-25)",
+    "C32": "Boeing C-32A (Air Force Two / VIP)",
+    "C40": "Boeing C-40 Clipper",
+    "E4B": "E-4B Nightwatch (National Airborne Ops Center)",
 }
-TARGET_TYPES = list(AIRCRAFT_NAMES.keys())
 
-CATEGORY_BY_TYPE = {}
-for t in ["K35R", "KC135", "KC10", "KC46", "A332", "A400"]:
-    CATEGORY_BY_TYPE[t] = "TANKER"
-for t in ["C17", "C130", "C30J", "C5", "IL76", "AN124"]:
-    CATEGORY_BY_TYPE[t] = "CARGO"
-for t in ["P8", "RC135", "E3TF", "E3", "E8", "E2", "RQ4", "MQ9"]:
-    CATEGORY_BY_TYPE[t] = "ISR"
-for t in ["VC25", "C32", "C40"]:
-    CATEGORY_BY_TYPE[t] = "VIP"
-for t in ["B52", "B1", "B2", "F15", "F16", "F22", "F35", "F18", "A10"]:
-    CATEGORY_BY_TYPE[t] = "COMBAT"
-
-MIL_CALLSIGNS = [
-    "RCH", "REACH", "DUKE", "PAT", "EVAC", "CNV", "TOPCAT", "SNOOP",
-    "JAKE", "SAM", "SPAR", "TEAL", "GOLD", "CLEAN", "NAVY", "EXEC",
-    "DOOM", "HOSER", "TUF", "BOEING", "CMB", "CAMBER", "GTI", "CKS",
-    "NATO", "RRR", "CTM", "IAF", "LAGR", "NCHO", "FORTE", "HOMER",
+US_CALLSIGN_PREFIXES = [
+    "RCH", "REACH", "MOOSE", "SLAM", "ORDER",  # Air Mobility Command (AMC)
+    "LAGR", "NCHO", "GOLD", "CLEAN", "BOBBY", "PEARL", "SHELL",  # Tankers
+    "FORTE", "HOMER", "OLIVE", "COBRA", "PYTHON", "SNOOP", "JAKE",  # ISR / Recon
+    "DOOM", "DEATH", "MYTEE", "BONE", "DARK", "SKULL",  # Bombers
+    "NAVY", "TOPCAT", "VNDL", "GOTO",  # US Navy
+    "PAT", "EVAC", "SAM", "EXEC", "SPAR",  # Priority Logistics & Command
 ]
 
+ALLIED_MIL_PREFIXES = [
+    "RRR", "ASCOT", "TARTAN",  # Royal Air Force
+    "IAF", "ISF",              # Israeli Air Force
+    "CTM", "COTAM",            # French Air Force
+    "GAF", "GAM",              # German Air Force
+    "NATO", "NAF",
+]
+
+def is_us_military_hex(icao_hex: str) -> bool:
+    """Mode-S hex range allocated to US DoD / Military."""
+    try:
+        val = int(icao_hex, 16)
+        # ae0000 to aeffff or af0000 to afffff
+        return (0xAE0000 <= val <= 0xAFFFFF)
+    except Exception:
+        return False
 
 # ==================================================================
-# STATE
+# STATE MANAGEMENT
 # ==================================================================
 
 def load_state():
@@ -109,115 +133,217 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-
-    seen = []
-    if os.path.exists(LEGACY_STATE_FILE):
-        try:
-            with open(LEGACY_STATE_FILE, "r") as f:
-                legacy = json.load(f)
-            seen = [{"key": k, "ts": now_utc().isoformat()} for k in legacy]
-        except Exception:
-            pass
-
     return {
-        "seen_flights": seen,
+        "seen_flights": [],
         "mil_snapshot_log": [],
         "civil_corridor_log": [],
         "last_escalation_level": "LOW",
         "last_fallback_post_ts": None,
     }
 
-
 def save_state(state):
     cutoff = now_utc() - timedelta(hours=48)
-
     state["seen_flights"] = [
         s for s in state["seen_flights"]
         if datetime.fromisoformat(s["ts"]) > now_utc() - timedelta(hours=REANNOUNCE_AFTER_HOURS)
     ][-1000:]
-
     state["mil_snapshot_log"] = [
         s for s in state["mil_snapshot_log"] if datetime.fromisoformat(s["ts"]) > cutoff
     ][-500:]
-
     state["civil_corridor_log"] = [
         s for s in state["civil_corridor_log"] if datetime.fromisoformat(s["ts"]) > (now_utc() - timedelta(days=14))
     ][-2000:]
-
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
-
 def is_recently_seen(state, flight_key):
-    return any(s["key"] == flight_key for s in state["seen_flights"])
-
+    return any(s["key"] == flight_key for s in state.get("seen_flights", []))
 
 def mark_seen(state, flight_key):
-    state["seen_flights"].append({"key": flight_key, "ts": now_utc().isoformat()})
-
+    state.setdefault("seen_flights", []).append({"key": flight_key, "ts": now_utc().isoformat()})
 
 # ==================================================================
-# DATA FETCH
+# DATA FETCHING (ADSB.lol, ADSB.fi & OpenSky)
 # ==================================================================
 
-def fetch_adsb_data():
-    """Fetches aircraft from multiple open OSINT endpoints, tiled across
-    the whole region. Logs per-source counts so a silent zero-results
-    run (e.g. a cloud IP being soft-blocked) is visible in the log
-    instead of looking like "no aircraft anywhere right now"."""
-    aircraft = []
-    headers = {"User-Agent": "OSINT-Flight-Tracker/1.0"}
-
+def fetch_from_adsb_lol():
+    results = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+    # 1. Global military feed
     try:
-        res = requests.get("https://api.airplanes.live/v2/mil", headers=headers, timeout=15)
-        log(f"[ Fetch ] Global mil endpoint -> HTTP {res.status_code}")
+        url = "https://api.adsb.lol/v2/mil"
+        res = requests.get(url, headers=headers, timeout=12)
         if res.status_code == 200:
-            data = res.json()
-            ac = data.get("ac", [])
-            log(f"[ Fetch ] Global mil endpoint returned {len(ac)} aircraft")
-            aircraft.extend(ac)
+            ac = res.json().get("ac", [])
+            log(f"[ adsb.lol ] Global mil endpoint returned {len(ac)} aircraft")
+            results.extend(ac)
         else:
-            log(f"[ Fetch ] Global mil endpoint body (first 200 chars): {res.text[:200]!r}")
+            log(f"[ adsb.lol ] Global mil returned HTTP {res.status_code}")
     except Exception as e:
-        log(f"[ Warn ] Global mil endpoint failed: {e}")
+        log(f"[ Warn ] adsb.lol mil endpoint failed: {e}")
 
+    # 2. Regional point queries
     for label, lat, lon in REGION_POINTS:
         try:
-            res = requests.get(
-                f"https://api.adsb.one/v2/point/{lat}/{lon}/{POINT_RADIUS_NM}",
-                headers=headers, timeout=15,
-            )
+            url = f"https://api.adsb.lol/v2/point/{lat}/{lon}/{POINT_RADIUS_NM}"
+            res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 200:
-                data = res.json()
-                ac = data.get("ac", [])
-                log(f"[ Fetch ] {label} -> HTTP 200, {len(ac)} aircraft")
-                aircraft.extend(ac)
-            else:
-                log(f"[ Fetch ] {label} -> HTTP {res.status_code}, body: {res.text[:150]!r}")
+                ac = res.json().get("ac", [])
+                log(f"[ adsb.lol ] {label} -> {len(ac)} aircraft")
+                results.extend(ac)
         except Exception as e:
-            log(f"[ Warn ] Point search failed for {label}: {e}")
+            log(f"[ Warn ] adsb.lol point failed for {label}: {e}")
+    return results
 
-    unique_ac = {}
-    for ac in aircraft:
-        hex_code = ac.get("hex")
-        if hex_code and hex_code not in unique_ac:
-            unique_ac[hex_code] = ac
+def fetch_from_adsb_fi():
+    results = []
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; MilitaryFlightTracker/2.0)", "Accept": "application/json"}
+    try:
+        url = "https://opendata.adsb.fi/api/v2/mil"
+        res = requests.get(url, headers=headers, timeout=12)
+        if res.status_code == 200:
+            ac = res.json().get("ac", [])
+            log(f"[ adsb.fi ] Military endpoint returned {len(ac)} aircraft")
+            results.extend(ac)
+    except Exception as e:
+        log(f"[ Warn ] adsb.fi failed: {e}")
+    return results
 
-    log(f"[ Fetch ] Total unique aircraft across all sources (pre-bbox-filter): {len(unique_ac)}")
-    return list(unique_ac.values())
+def fetch_from_opensky():
+    """Fallback query to OpenSky Network covering the regional bounding box."""
+    results = []
+    headers = {"User-Agent": "MilitaryFlightTracker/2.0"}
+    auth = (OPENSKY_USER, OPENSKY_PASS) if (OPENSKY_USER and OPENSKY_PASS) else None
+    url = f"https://opensky-network.org/api/states/all?lamin={LAT_MIN}&lomin={LON_MIN}&lamax={LAT_MAX}&lomax={LON_MAX}"
+    try:
+        res = requests.get(url, headers=headers, auth=auth, timeout=15)
+        if res.status_code == 200:
+            data = res.json()
+            states = data.get("states", []) or []
+            log(f"[ OpenSky ] Regional query returned {len(states)} aircraft")
+            for s in states:
+                # OpenSky format: [icao24, callsign, origin_country, time_pos, last_contact, lon, lat, baro_alt, on_ground, vel, track, ...]
+                results.append({
+                    "hex": str(s[0]).strip().lower(),
+                    "flight": str(s[1]).strip() if s[1] else "",
+                    "lat": s[6],
+                    "lon": s[5],
+                    "alt_baro": int(s[7] * 3.28084) if s[7] is not None else None,
+                    "gs": int(s[9] * 1.94384) if s[9] is not None else None,
+                    "track": s[10],
+                    "t": "",  # OpenSky basic state vector doesn't have aircraft type
+                    "dbFlags": 1 if s[2] == "United States" and is_us_military_hex(str(s[0])) else 0,
+                })
+    except Exception as e:
+        log(f"[ Warn ] OpenSky fetch failed: {e}")
+    return results
 
+def fetch_all_aircraft():
+    """Collects and deduplicates aircraft across active endpoints."""
+    raw = []
+    raw.extend(fetch_from_adsb_lol())
+    raw.extend(fetch_from_adsb_fi())
+
+    # If primary community feeds were blocked/down, fallback to OpenSky
+    if len(raw) == 0:
+        log("[ Fallback ] Primary ADS-B sources yielded 0. Polling OpenSky Network...")
+        raw.extend(fetch_from_opensky())
+
+    dedup = {}
+    for ac in raw:
+        hex_code = str(ac.get("hex", "")).strip().lower()
+        if hex_code and hex_code not in dedup:
+            dedup[hex_code] = ac
+
+    log(f"[ Fetch ] Total unique regional aircraft fetched: {len(dedup)}")
+    return list(dedup.values())
 
 def get_plane_photo(icao: str):
     try:
         url = f"https://api.planespotters.net/pub/photos/hex/{icao}"
-        headers = {"User-Agent": "OSINT-Flight-Bot/1.0"}
-        res = requests.get(url, headers=headers, timeout=10).json()
+        headers = {"User-Agent": "MilitaryFlightTracker/2.0"}
+        res = requests.get(url, headers=headers, timeout=5).json()
         if res.get("photos"):
             return res["photos"][0]["thumbnail_large"]["src"]
     except Exception:
         pass
     return None
 
+# ==================================================================
+# CLASSIFICATION & FLIGHT ORIENTATION
+# ==================================================================
+
+def in_region(lat, lon) -> bool:
+    return lat is not None and lon is not None and LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX
+
+def in_hormuz_corridor(lat, lon) -> bool:
+    return (lat is not None and lon is not None
+            and HORMUZ_LAT_MIN <= lat <= HORMUZ_LAT_MAX and HORMUZ_LON_MIN <= lon <= HORMUZ_LON_MAX)
+
+def classify_role(typecode: str):
+    typecode = typecode.upper().strip()
+    if typecode in ["C17", "C5", "C130", "C30J", "A400", "IL76", "AN124"]:
+        return "STRATEGIC AIRLIFT / LOGISTICS"
+    if typecode in ["KC135", "K35R", "KC46", "KC10", "A332"]:
+        return "AERIAL REFUELING TANKER"
+    if typecode in ["P8", "RC135", "E3TF", "E3", "E8", "E2", "RQ4", "MQ9", "U2"]:
+        return "ISR & RECONNAISSANCE"
+    if typecode in ["B52", "B1", "B2", "F15", "F16", "F22", "F35", "F18", "A10"]:
+        return "COMBAT / STRIKE ASSET"
+    if typecode in ["VC25", "C32", "C40", "E4B"]:
+        return "VIP / STRATEGIC COMMAND"
+    return "TACTICAL MILITARY SUPPORT"
+
+def is_target_military(ac: dict) -> bool:
+    icao = str(ac.get("hex", "")).strip().lower()
+    callsign = str(ac.get("flight", "")).strip().upper()
+    typecode = str(ac.get("t", "")).strip().upper()
+    db_flags = ac.get("dbFlags", 0)
+
+    if is_us_military_hex(icao) or db_flags == 1:
+        return True
+    if typecode in AIRCRAFT_NAMES:
+        return True
+    if any(callsign.startswith(p) for p in US_CALLSIGN_PREFIXES + ALLIED_MIL_PREFIXES):
+        return True
+    return False
+
+def determine_movement_posture(track, lat, lon):
+    """Evaluates whether an aircraft is reinforcing into the theater, exiting, or patrolling."""
+    if track is None:
+        return "Track Bearing Unknown"
+    # Heading 45° to 135° = Eastbound (inbound from Europe/US towards Persian Gulf)
+    if 45 <= track <= 135:
+        return "➡️ INBOUND / REINFORCEMENT CORRIDOR (Heading East toward Gulf/Levant)"
+    # Heading 225° to 315° = Westbound (egress / return to bases in Europe/US)
+    elif 225 <= track <= 315:
+        return "⬅️ OUTBOUND / EGRESS TRANSIT (Heading West)"
+    elif 136 <= track <= 224:
+        return "⬇️ SOUTHBOUND TRANSIT (Red Sea / Arabian Gulf)"
+    else:
+        return "🔄 THEATER PATROL / ORBIT POSTURE"
+
+def determine_airspace_sector(lat, lon) -> str:
+    if lat is None or lon is None:
+        return "🌐 Regional Airspace"
+    if HORMUZ_LAT_MIN <= lat <= HORMUZ_LAT_MAX and HORMUZ_LON_MIN <= lon <= HORMUZ_LON_MAX:
+        return "🌊 Strait of Hormuz & Persian Gulf Chokepoint"
+    if 25.0 <= lat <= 39.0 and 45.0 <= lon <= 63.0:
+        return "🇮🇷 Iranian Airspace / Boundary"
+    if 29.0 <= lat <= 37.0 and 38.0 <= lon <= 46.0:
+        return "🇮🇶 Iraqi Airspace Corridor"
+    if 29.0 <= lat <= 34.0 and 34.0 <= lon <= 37.0:
+        return "🇮🇱 Israel / Levant Forward Sector"
+    if 22.0 <= lat <= 27.0 and 46.0 <= lon <= 52.0:
+        return "🇸🇦 Saudi Arabia Central/Eastern Sector"
+    if 22.5 <= lat <= 26.5 and 50.5 <= lon <= 56.5:
+        return "🇦🇪🇶🇦 Al Udeid / Al Dhafra Base Airspace (UAE/Qatar)"
+    if 13.0 <= lat <= 22.0 and 38.0 <= lon <= 45.0:
+        return "🔴 Red Sea / Bab el-Mandeb Strategic Corridor"
+    return "🌐 Regional Middle East Sector"
 
 # ==================================================================
 # SCREENSHOTS (Playwright)
@@ -235,21 +361,16 @@ def _screenshot(map_url: str, filename: str, render_wait_ms: int = 7000):
             log(f"[ Playwright ] Screenshot saved: {filename}")
             return filename
     except Exception as e:
-        log(f"[ Error ] Screenshot failed for {map_url}: {e}")
+        log(f"[ Warn ] Screenshot failed for {map_url}: {e}")
         return None
 
-
-def capture_map_screenshot(icao: str) -> str:
-    map_url = f"https://globe.airplanes.live/?icao={icao.lower()}"
-    log(f"[ Playwright ] Capturing flight track map for {icao}...")
-    return _screenshot(map_url, f"map_flight_{icao}.png", render_wait_ms=6000)
-
+def capture_flight_map(icao: str) -> str:
+    map_url = f"https://globe.adsb.lol/?icao={icao.lower()}"
+    return _screenshot(map_url, f"map_{icao}.png", render_wait_ms=5000)
 
 def capture_regional_overview_map() -> str:
-    map_url = f"https://globe.airplanes.live/?lat={OVERVIEW_LAT}&lon={OVERVIEW_LON}&zoom={OVERVIEW_ZOOM}"
-    log("[ Playwright ] Capturing Iran + Gulf + Iraq + Israel regional overview map...")
-    return _screenshot(map_url, "regional_overview.png", render_wait_ms=8000)
-
+    map_url = f"https://globe.adsb.lol/?lat={OVERVIEW_LAT}&lon={OVERVIEW_LON}&zoom={OVERVIEW_ZOOM}"
+    return _screenshot(map_url, "overview.png", render_wait_ms=6000)
 
 def cleanup_file(path):
     if path and os.path.exists(path):
@@ -258,386 +379,153 @@ def cleanup_file(path):
         except Exception:
             pass
 
-
 # ==================================================================
-# CLASSIFICATION
+# TELEGRAM MESSAGING
 # ==================================================================
 
-def in_region(lat, lon) -> bool:
-    return lat is not None and lon is not None and LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX
+def send_telegram_media(caption, photo_paths):
+    valid = [p for p in photo_paths if p and os.path.exists(p)]
+    if not valid:
+        # Fallback to plain text
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": TELEGRAM_CHANNEL_ID, "text": caption, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
+        return
 
-
-def in_hormuz_corridor(lat, lon) -> bool:
-    return (lat is not None and lon is not None
-            and HORMUZ_LAT_MIN <= lat <= HORMUZ_LAT_MAX and HORMUZ_LON_MIN <= lon <= HORMUZ_LON_MAX)
-
-
-def is_target_military(aircraft: dict) -> bool:
-    icao = str(aircraft.get("hex", "")).lower().strip()
-    callsign = str(aircraft.get("flight", "")).upper().strip()
-    typecode = str(aircraft.get("t", "")).upper().strip()
-    db_flags = aircraft.get("dbFlags", 0)
-
-    if icao.startswith("ae") or icao.startswith("af") or db_flags == 1:
-        return True
-    if typecode in TARGET_TYPES:
-        return True
-    if any(callsign.startswith(prefix) for prefix in MIL_CALLSIGNS):
-        return True
-    return False
-
-
-def classify_type(typecode: str):
-    return CATEGORY_BY_TYPE.get(typecode.upper().strip())
-
-
-def determine_airspace_sector(lat, lon) -> str:
-    if lat is None or lon is None:
-        return "🌐 Regional Strategic Airspace"
-    if HORMUZ_LAT_MIN <= lat <= HORMUZ_LAT_MAX and HORMUZ_LON_MIN <= lon <= HORMUZ_LON_MAX:
-        return "🌊 Strait of Hormuz & Persian Gulf Maritime Corridor"
-    elif 25.0 <= lat <= 39.0 and 45.0 <= lon <= 63.0:
-        return "🇮🇷 Iranian Airspace & Central Sector"
-    elif 29.0 <= lat <= 37.0 and 38.0 <= lon <= 46.0:
-        return "🇮🇶 Iraqi Airspace Sector"
-    elif 29.0 <= lat <= 34.0 and 34.0 <= lon <= 37.0:
-        return "🇮🇱 Israel / Levant Air Corridor"
-    elif 22.0 <= lat <= 27.0 and 46.0 <= lon <= 52.0:
-        return "🇸🇦 Saudi Arabia / Eastern Gulf Sector"
-    elif 22.5 <= lat <= 26.5 and 50.5 <= lon <= 56.5:
-        return "🇦🇪🇶🇦🇧🇭 UAE / Qatar / Bahrain Sector"
-    elif 28.5 <= lat <= 30.5 and 46.5 <= lon <= 49.0:
-        return "🇰🇼 Kuwait Sector"
-    elif 16.0 <= lat <= 26.5 and 51.5 <= lon <= 60.0:
-        return "🇴🇲 Oman / S. Hormuz Approach Sector"
+    if len(valid) == 1:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        with open(valid[0], "rb") as f:
+            requests.post(url, data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}, files={"photo": f}, timeout=25)
     else:
-        return "🌐 Regional Airspace Sector"
-
-
-def get_exact_aircraft_title(typecode: str, callsign: str) -> str:
-    typecode = typecode.upper().strip()
-    callsign = callsign.upper().strip()
-    exact_name = AIRCRAFT_NAMES.get(typecode, typecode if typecode else "Military Aircraft")
-    if callsign and callsign != "N/A":
-        return f"🚨 {exact_name} ({callsign}) DETECTED 🚨"
-    return f"🚨 {exact_name} DETECTED 🚨"
-
-
-# ==================================================================
-# ESCALATION SCORING
-# ==================================================================
-
-ESCALATION_BANDS = [
-    (85, "CRITICAL", "🔴"), (65, "HIGH", "🟠"), (40, "ELEVATED", "🟡"),
-    (20, "GUARDED", "🔵"), (0, "LOW", "🟢"),
-]
-
-
-def escalation_label(score):
-    for threshold, label, emoji in ESCALATION_BANDS:
-        if score >= threshold:
-            return label, emoji
-    return "LOW", "🟢"
-
-
-def compute_escalation(state, current_mil_snapshot, current_civil_corridor_count):
-    score = 0
-    factors = []
-
-    one_hour_ago = now_utc() - timedelta(hours=1)
-    day_ago = now_utc() - timedelta(hours=24)
-    recent_log = [s for s in state["mil_snapshot_log"] if datetime.fromisoformat(s["ts"]) > day_ago]
-    baseline_counts = [s["count"] for s in recent_log if datetime.fromisoformat(s["ts"]) <= one_hour_ago]
-    baseline = (sum(baseline_counts) / len(baseline_counts)) if baseline_counts else 0
-    current_count = len(current_mil_snapshot)
-
-    if current_count >= 5 and (baseline < 1 or current_count >= baseline * 2.5):
-        score += 30
-        factors.append(f"Military traffic spike: {current_count} active vs baseline ~{baseline:.1f}")
-    elif current_count >= 8:
-        score += 20
-        factors.append(f"High absolute military volume: {current_count} active aircraft in region")
-
-    categories_present = set()
-    for ac in current_mil_snapshot:
-        cat = classify_type(str(ac.get("t", "")).upper().strip())
-        if cat:
-            categories_present.add(cat)
-
-    if "VIP" in categories_present:
-        score += 40
-        factors.append("VIP / high-value government aircraft airborne in region")
-
-    if "TANKER" in categories_present and "COMBAT" in categories_present:
-        score += 30
-        factors.append("Tanker + combat aircraft together (possible strike package / escort posture)")
-
-    isr_count = sum(1 for ac in current_mil_snapshot if classify_type(str(ac.get("t", "")).upper().strip()) == "ISR")
-    if isr_count >= 2:
-        score += 15
-        factors.append(f"ISR clustering: {isr_count} reconnaissance/surveillance aircraft active simultaneously")
-
-    cargo_count = sum(1 for ac in current_mil_snapshot if classify_type(str(ac.get("t", "")).upper().strip()) == "CARGO")
-    if cargo_count >= 3:
-        score += 10
-        factors.append(f"Airlift surge: {cargo_count} military cargo aircraft active simultaneously")
-
-    civil_baseline_counts = [s["count"] for s in state["civil_corridor_log"]
-                              if datetime.fromisoformat(s["ts"]) <= one_hour_ago]
-    civil_baseline = (sum(civil_baseline_counts) / len(civil_baseline_counts)) if civil_baseline_counts else 0
-
-    if civil_baseline >= 8 and current_civil_corridor_count <= civil_baseline * 0.4:
-        score += 25
-        factors.append(
-            f"Possible airline avoidance of Hormuz/Gulf corridor: {current_civil_corridor_count} civil "
-            f"flights vs baseline ~{civil_baseline:.1f} (airlines may be rerouting due to tension)"
-        )
-
-    score = min(score, 100)
-    label, emoji = escalation_label(score)
-    return score, label, emoji, factors, baseline, current_count
-
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup"
+        media = []
+        files = {}
+        opened = []
+        try:
+            for i, p in enumerate(valid):
+                k = f"p_{i}"
+                fh = open(p, "rb")
+                opened.append(fh)
+                files[k] = fh
+                item = {"type": "photo", "media": f"attach://{k}"}
+                if i == 0:
+                    item["caption"] = caption
+                    item["parse_mode"] = "HTML"
+                media.append(item)
+            requests.post(url, data={"chat_id": TELEGRAM_CHANNEL_ID, "media": json.dumps(media)}, files=files, timeout=30)
+        finally:
+            for fh in opened:
+                fh.close()
 
 # ==================================================================
-# TELEGRAM
-# ==================================================================
-
-def send_telegram_message(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHANNEL_ID, "text": text,
-        "parse_mode": "HTML", "disable_web_page_preview": True,
-    }
-    try:
-        res = requests.post(url, data=payload, timeout=15).json()
-        log(f"[ Telegram ] sendMessage -> {res.get('ok')}")
-        return res
-    except Exception as e:
-        log(f"[ Error ] sendMessage failed: {e}")
-        return None
-
-
-def send_telegram_photo_file(photo_path, caption):
-    if not photo_path or not os.path.exists(photo_path):
-        log("[ Telegram ] No screenshot file available, sending text only")
-        return send_telegram_message(caption)
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    try:
-        with open(photo_path, "rb") as f:
-            files = {"photo": f}
-            data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
-            res = requests.post(url, data=data, files=files, timeout=30).json()
-        log(f"[ Telegram ] sendPhoto -> {res.get('ok')} {'' if res.get('ok') else res}")
-        if not res.get("ok"):
-            return send_telegram_message(caption)
-        return res
-    except Exception as e:
-        log(f"[ Error ] sendPhoto (file) failed: {e}, falling back to text")
-        return send_telegram_message(caption)
-
-
-def send_telegram_media_group(caption, photo_paths):
-    valid_paths = [p for p in photo_paths if p and os.path.exists(p)]
-    if not valid_paths:
-        log("[ Telegram ] No screenshot files available, sending text only")
-        return send_telegram_message(caption)
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup"
-    media = []
-    files = {}
-    opened = []
-    try:
-        for i, path in enumerate(valid_paths):
-            file_key = f"photo_{i}"
-            fh = open(path, "rb")
-            opened.append(fh)
-            files[file_key] = fh
-            item = {"type": "photo", "media": f"attach://{file_key}"}
-            if i == 0:
-                item["caption"] = caption
-                item["parse_mode"] = "HTML"
-            media.append(item)
-
-        payload = {"chat_id": TELEGRAM_CHANNEL_ID, "media": json.dumps(media)}
-        res = requests.post(url, data=payload, files=files, timeout=30).json()
-        log(f"[ Telegram ] sendMediaGroup -> {res.get('ok')} {'' if res.get('ok') else res}")
-        if not res.get("ok"):
-            return send_telegram_message(caption)
-        return res
-    except Exception as e:
-        log(f"[ Error ] sendMediaGroup failed: {e}, falling back to text")
-        return send_telegram_message(caption)
-    finally:
-        for fh in opened:
-            fh.close()
-
-
-def emoji_line(emoji, score, label):
-    return f"{emoji} <b>Regional escalation index:</b> <code>{score}/100 ({label})</code>\n\n"
-
-
-def post_detection(ac, sector, escalation_score, escalation_label_str, escalation_emoji, overview_path):
-    icao = str(ac.get("hex", "")).strip()
-    callsign = str(ac.get("flight", "N/A")).strip() or "N/A"
-    typecode = str(ac.get("t", "Unknown Type")).strip()
-    alt = ac.get("alt_baro", "N/A")
-    speed = ac.get("gs", "N/A")
-    lat, lon = ac.get("lat"), ac.get("lon")
-    title_header = get_exact_aircraft_title(typecode, callsign)
-
-    photo_url = get_plane_photo(icao)
-    photo_link = f"📸 <a href='{photo_url}'>مشاهده عکس هواپیما</a>\n" if photo_url else ""
-    flight_map = capture_map_screenshot(icao)
-
-    caption = (
-        f"<b>{title_header}</b>\n"
-        f"📍 <b>Sector:</b> <i>{sector}</i>\n\n"
-        f"✈️ <b>Callsign:</b> <code>{callsign}</code>\n"
-        f"🆔 <b>ICAO Hex:</b> <code>{icao.upper()}</code>\n"
-        f"🛩️ <b>Type:</b> <code>{typecode}</code>\n"
-        f"📈 <b>Altitude:</b> <code>{alt} ft</code> | 💨 <b>Speed:</b> <code>{speed} kts</code>\n"
-        f"🗺️ <b>Coordinates:</b> <code>{lat}, {lon}</code>\n\n"
-        f"{photo_link}"
-        f"{emoji_line(escalation_emoji, escalation_score, escalation_label_str)}"
-        f"🔗 <a href='https://globe.airplanes.live/?icao={icao}'>ردیابی زنده رادار</a>\n"
-        f"✈️ @secretollah"
-    )
-
-    photo_list = [p for p in [overview_path, flight_map] if p]
-    res = send_telegram_media_group(caption, photo_list) if photo_list else send_telegram_message(caption)
-    cleanup_file(flight_map)
-    return res
-
-
-def post_escalation_change(old_label, new_label, score, emoji, factors, overview_path):
-    direction = "🔺 ESCALATION" if _band_rank(new_label) > _band_rank(old_label) else "🔻 DE-ESCALATION"
-    factor_text = "\n".join(f"• {f}" for f in factors) if factors else "• No specific contributing factors logged"
-    text = (
-        f"{emoji} <b>{direction} LEVEL CHANGE</b>\n\n"
-        f"Regional posture shifted: <b>{old_label} → {new_label}</b>\n"
-        f"<b>Escalation index:</b> <code>{score}/100</code>\n\n"
-        f"<b>Contributing factors:</b>\n{factor_text}\n\n"
-        f"✈️ @secretollah"
-    )
-    return send_telegram_photo_file(overview_path, text)
-
-
-def post_civil_anomaly(current_count, baseline, overview_path):
-    text = (
-        f"🟡 <b>CIVIL TRAFFIC ANOMALY — Hormuz/Gulf Corridor</b>\n\n"
-        f"Civilian flight volume in the Strait of Hormuz / Persian Gulf corridor has dropped to "
-        f"<code>{current_count}</code> aircraft, versus a recent baseline of ~<code>{baseline:.1f}</code>.\n"
-        f"This can indicate airlines proactively rerouting away from the area due to perceived risk.\n\n"
-        f"🔗 <a href='https://globe.airplanes.live/?lat={OVERVIEW_LAT}&lon={OVERVIEW_LON}&zoom={OVERVIEW_ZOOM}'>ردیابی زنده رادار</a>\n"
-        f"✈️ @secretollah"
-    )
-    return send_telegram_photo_file(overview_path, text)
-
-
-def post_heartbeat(total_scanned, mil_count, civil_corridor_count, escalation_score, label, emoji, overview_path):
-    text = (
-        f"🌐 <b>REGIONAL AIRSPACE STATUS</b>\n\n"
-        f"ℹ️ <i>Routine interval check — no new military detections this cycle.</i>\n"
-        f"📊 <b>Total regional aircraft monitored:</b> <code>{total_scanned}</code>\n"
-        f"🪖 <b>Active military aircraft:</b> <code>{mil_count}</code>\n"
-        f"🌊 <b>Civil traffic — Hormuz/Gulf corridor:</b> <code>{civil_corridor_count}</code>\n\n"
-        f"{emoji_line(emoji, escalation_score, label)}"
-        f"🔗 <a href='https://globe.airplanes.live/?lat={OVERVIEW_LAT}&lon={OVERVIEW_LON}&zoom={OVERVIEW_ZOOM}'>ردیابی زنده رادار</a>\n"
-        f"✈️ @secretollah"
-    )
-    return send_telegram_photo_file(overview_path, text)
-
-
-def _band_rank(label):
-    order = ["LOW", "GUARDED", "ELEVATED", "HIGH", "CRITICAL"]
-    return order.index(label) if label in order else 0
-
-
-# ==================================================================
-# MAIN
+# MAIN ORCHESTRATION
 # ==================================================================
 
 def run_tracker():
     log("==================================================")
-    log("   OSINT Sky Radar — Iran, Gulf, Iraq & Israel     ")
+    log("   OSINT Sky Radar — US & Allied Mideast Logistics Tracker ")
     log("==================================================")
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
-        log("[ Error ] TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL_ID missing!")
+        log("[ Error ] Telegram credentials missing. Check GitHub Repository Secrets!")
         return
 
     state = load_state()
-    aircraft_list = fetch_adsb_data()
+    raw_aircraft = fetch_all_aircraft()
 
-    valid_flights = [ac for ac in aircraft_list if in_region(ac.get("lat"), ac.get("lon"))]
-    total_scanned = len(valid_flights)
-    log(f"[ Scan ] Evaluated {total_scanned} active regional aircraft (after bounding-box filter).")
+    # CRITICAL GUARD: Never process zero aircraft as genuine status (prevents false alerts)
+    if len(raw_aircraft) == 0:
+        log("[ ABORT ] All ADS-B endpoints returned 0 aircraft (likely network/rate limit). Preserving state without alerts.")
+        return
 
-    current_mil_snapshot = [ac for ac in valid_flights if is_target_military(ac)]
-    civil_corridor_flights = [
-        ac for ac in valid_flights
-        if not is_target_military(ac) and in_hormuz_corridor(ac.get("lat"), ac.get("lon"))
-    ]
+    valid_flights = [ac for ac in raw_aircraft if in_region(ac.get("lat"), ac.get("lon"))]
+    log(f"[ Scan ] Filtered {len(valid_flights)} aircraft inside Middle East theater bounding box.")
 
-    state["mil_snapshot_log"].append({"ts": now_utc().isoformat(), "count": len(current_mil_snapshot)})
-    state["civil_corridor_log"].append({"ts": now_utc().isoformat(), "count": len(civil_corridor_flights)})
+    mil_flights = [ac for ac in valid_flights if is_target_military(ac)]
+    civil_hormuz_flights = [ac for ac in valid_flights if not is_target_military(ac) and in_hormuz_corridor(ac.get("lat"), ac.get("lon"))]
 
-    escalation_score, escalation_lvl, escalation_emoji, factors, mil_baseline, mil_count = compute_escalation(
-        state, current_mil_snapshot, len(civil_corridor_flights)
-    )
-    log(f"[ Escalation ] {escalation_score}/100 ({escalation_lvl}) — factors: {factors}")
+    log(f"[ Status ] Active military assets: {len(mil_flights)} | Civil Gulf traffic: {len(civil_hormuz_flights)}")
 
-    overview_path = capture_regional_overview_map()
+    # Update baseline logs
+    state["mil_snapshot_log"].append({"ts": now_utc().isoformat(), "count": len(mil_flights)})
+    state["civil_corridor_log"].append({"ts": now_utc().isoformat(), "count": len(civil_hormuz_flights)})
+
+    overview_img = capture_regional_overview_map()
 
     try:
-        new_detections = 0
-        for ac in current_mil_snapshot:
-            icao = str(ac.get("hex", "")).strip()
-            callsign = str(ac.get("flight", "N/A")).strip()
-            if not icao:
-                continue
+        new_alerts = 0
+        for ac in mil_flights:
+            icao = str(ac.get("hex", "")).strip().lower()
+            callsign = str(ac.get("flight", "N/A")).strip().upper() or "N/A"
             flight_key = f"{icao}_{callsign}"
-            if is_recently_seen(state, flight_key):
+
+            if not icao or is_recently_seen(state, flight_key):
                 continue
 
             mark_seen(state, flight_key)
-            new_detections += 1
-            sector = determine_airspace_sector(ac.get("lat"), ac.get("lon"))
-            res = post_detection(ac, sector, escalation_score, escalation_lvl, escalation_emoji, overview_path)
-            log(f"[ Posted ] {icao} {callsign} -> {res is not None}")
+            new_alerts += 1
 
-        log(f"[ Summary ] {new_detections} new military detections this cycle "
-            f"({len(current_mil_snapshot)} currently active in region).")
+            typecode = str(ac.get("t", "MIL")).strip().upper()
+            model_name = AIRCRAFT_NAMES.get(typecode, f"Military Platform ({typecode})")
+            role = classify_role(typecode)
+            is_us = is_us_military_hex(icao) or any(callsign.startswith(p) for p in US_CALLSIGN_PREFIXES)
+            operator_label = "🇺🇸 US Armed Forces / Air Mobility Command" if is_us else "🪖 Allied / Regional Military"
 
-        if escalation_lvl != state.get("last_escalation_level", "LOW"):
-            post_escalation_change(state.get("last_escalation_level", "LOW"), escalation_lvl,
-                                    escalation_score, escalation_emoji, factors, overview_path)
-            state["last_escalation_level"] = escalation_lvl
+            alt = ac.get("alt_baro", "N/A")
+            spd = ac.get("gs", "N/A")
+            track = ac.get("track")
+            lat, lon = ac.get("lat"), ac.get("lon")
 
-        civil_anomaly_factor = next((f for f in factors if "Hormuz/Gulf corridor" in f), None)
-        if civil_anomaly_factor:
-            one_hour_ago = now_utc() - timedelta(hours=1)
-            baseline_counts = [s["count"] for s in state["civil_corridor_log"]
-                                if datetime.fromisoformat(s["ts"]) <= one_hour_ago]
-            baseline = (sum(baseline_counts) / len(baseline_counts)) if baseline_counts else 0
-            post_civil_anomaly(len(civil_corridor_flights), baseline, overview_path)
+            posture = determine_movement_posture(track, lat, lon)
+            sector = determine_airspace_sector(lat, lon)
+            photo_url = get_plane_photo(icao)
+            photo_link = f"📸 <a href='{photo_url}'>Spotter Aircraft Photo</a>\n" if photo_url else ""
 
-        if new_detections == 0:
-            last_fb = state.get("last_fallback_post_ts")
-            should_post_heartbeat = (
-                last_fb is None
-                or datetime.fromisoformat(last_fb) < now_utc() - timedelta(hours=1)
+            flight_map = capture_flight_map(icao)
+
+            caption = (
+                f"🚨 <b>MILITARY FLIGHT DETECTED</b> 🚨\n"
+                f"<b>{model_name}</b>\n"
+                f"🏷️ <b>Operator:</b> {operator_label}\n"
+                f"🎯 <b>Mission Role:</b> <i>{role}</i>\n"
+                f"🧭 <b>Posture:</b> <code>{posture}</code>\n"
+                f"📍 <b>Airspace:</b> <i>{sector}</i>\n\n"
+                f"✈️ <b>Callsign:</b> <code>{callsign}</code>\n"
+                f"🆔 <b>ICAO Hex:</b> <code>{icao.upper()}</code>\n"
+                f"📈 <b>Altitude:</b> <code>{alt} ft</code> | 💨 <b>Speed:</b> <code>{spd} kts</code>\n"
+                f"🗺️ <b>Coords:</b> <code>{lat:.3f}, {lon:.3f}</code>\n\n"
+                f"{photo_link}"
+                f"🔗 <a href='https://globe.adsb.lol/?icao={icao}'>Live Radar Track</a>\n"
+                f"📡 @secretollah"
             )
-            if should_post_heartbeat:
-                post_heartbeat(total_scanned, len(current_mil_snapshot), len(civil_corridor_flights),
-                               escalation_score, escalation_lvl, escalation_emoji, overview_path)
+
+            photos = [p for p in [overview_img, flight_map] if p]
+            send_telegram_media(caption, photos)
+            cleanup_file(flight_map)
+            log(f"[ Alert Posted ] {callsign} ({icao}) - {model_name}")
+
+        # Routine Heartbeat (only post if no alerts and >2 hours since last heartbeat)
+        if new_alerts == 0:
+            last_hb = state.get("last_fallback_post_ts")
+            should_hb = (last_hb is None or datetime.fromisoformat(last_hb) < now_utc() - timedelta(hours=3))
+            if should_hb and len(valid_flights) > 10:  # Validates that scan was healthy
+                hb_caption = (
+                    f"🌐 <b>REGIONAL AIRSPACE SURVEILLANCE STATUS</b>\n\n"
+                    f"ℹ️ <i>Routine automated scan — Middle East theater.</i>\n"
+                    f"📊 <b>Monitored Aircraft:</b> <code>{len(valid_flights)}</code>\n"
+                    f"🪖 <b>Active Military Tracks:</b> <code>{len(mil_flights)}</code>\n"
+                    f"🌊 <b>Gulf Civilian Corridor:</b> <code>{len(civil_hormuz_flights)}</code>\n\n"
+                    f"🔗 <a href='https://globe.adsb.lol/?lat={OVERVIEW_LAT}&lon={OVERVIEW_LON}&zoom={OVERVIEW_ZOOM}'>Live Regional Map</a>\n"
+                    f"📡 @secretollah"
+                )
+                send_telegram_media(hb_caption, [overview_img] if overview_img else [])
                 state["last_fallback_post_ts"] = now_utc().isoformat()
+                log("[ Heartbeat Posted ] Routine surveillance status broadcasted.")
+
     finally:
-        cleanup_file(overview_path)
+        cleanup_file(overview_img)
 
     save_state(state)
-
+    log("[ Complete ] Cycle finished.")
 
 if __name__ == "__main__":
     try:
