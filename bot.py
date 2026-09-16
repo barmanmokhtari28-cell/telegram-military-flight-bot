@@ -21,19 +21,15 @@ OPENSKY_USER = os.getenv("OPENSKY_USER")
 OPENSKY_PASS = os.getenv("OPENSKY_PASS")
 
 # Geographic Boundaries
-# 1. Middle East Theater
 MIDEAST_LAT_MIN, MIDEAST_LAT_MAX = 12.0, 40.0
 MIDEAST_LON_MIN, MIDEAST_LON_MAX = 32.0, 65.0
 
-# 2. Iranian Airspace Boundary (for 12-hour report)
 IRAN_LAT_MIN, IRAN_LAT_MAX = 25.0, 39.0
 IRAN_LON_MIN, IRAN_LON_MAX = 44.0, 63.5
 
-# 3. Persian Gulf / Hormuz Corridor
 HORMUZ_LAT_MIN, HORMUZ_LAT_MAX = 24.0, 30.0
 HORMUZ_LON_MIN, HORMUZ_LON_MAX = 53.0, 60.0
 
-# Strategic points covering hubs across the US-Europe-Mideast pipeline
 REGION_POINTS = [
     ("Al Udeid AB / Qatar / Central Gulf", 25.1, 51.3),
     ("Al Dhafra AB / UAE / S. Gulf", 24.2, 54.5),
@@ -52,9 +48,7 @@ REGION_POINTS = [
 ]
 POINT_RADIUS_NM = 250
 
-CUMULATIVE_MAP_LAT, CUMULATIVE_MAP_LON, CUMULATIVE_MAP_ZOOM = 36.0, 20.0, 4
 OVERVIEW_LAT, OVERVIEW_LON, OVERVIEW_ZOOM = 27.5, 47.0, 5
-
 STATE_FILE = "state.json"
 REANNOUNCE_AFTER_HOURS = 8
 ANOMALY_COOLDOWN_HOURS = 3
@@ -70,7 +64,7 @@ def log(msg):
 now_utc = lambda: datetime.now(timezone.utc)
 
 # ==================================================================
-# AIRCRAFT TYPES & CALLSIGNS
+# AIRCRAFT TYPES & CALLSIGNS (Strict US & Israel Filtering)
 # ==================================================================
 
 AIRCRAFT_NAMES = {
@@ -130,7 +124,8 @@ US_LOGISTICS_CALLSIGNS = [
     "NAVY", "TOPCAT", "VNDL", "GOTO", "PAT", "EVAC", "SAM", "EXEC", "SPAR", "VENUS",
 ]
 
-ISRAEL_CALLSIGNS = ["IAF", "ISF", "ISR", "KNAF", "RAM", "ORON", "EITAM", "SHAVIT"]
+# STRICT Israeli Air Force identifiers (RAM removed to prevent commercial airline false positives)
+ISRAEL_CALLSIGNS = ["IAF", "ISF", "KNAF", "ISR01", "EITAM", "SHAVIT", "ORON"]
 ALLIED_MIL_PREFIXES = ["RRR", "ASCOT", "TARTAN", "CTM", "COTAM", "GAF", "GAM", "NATO", "NAF"]
 
 # ==================================================================
@@ -185,7 +180,7 @@ def fetch_from_adsb_lol():
         res = requests.get(url, headers=HTTP_HEADERS, timeout=14)
         if res.status_code == 200:
             ac = res.json().get("ac", [])
-            log(f"[ adsb.lol ] Global military endpoint returned {len(ac)} aircraft.")
+            log(f"[ adsb.lol ] Global military feed returned {len(ac)} aircraft.")
             results.extend(ac)
     except Exception as e:
         log(f"[ Warn ] adsb.lol global mil request failed: {e}")
@@ -218,7 +213,7 @@ def fetch_from_opensky():
     auth = (OPENSKY_USER, OPENSKY_PASS) if (OPENSKY_USER and OPENSKY_PASS) else None
     url = f"https://opensky-network.org/api/states/all?lamin={MIDEAST_LAT_MIN}&lomin={MIDEAST_LON_MIN}&lamax={MIDEAST_LAT_MAX}&lomax={MIDEAST_LON_MAX}"
     try:
-        res = requests.get(url, headers={"User-Agent": "MilitaryTracker/4.0"}, auth=auth, timeout=15)
+        res = requests.get(url, headers={"User-Agent": "MilitaryTracker/5.0"}, auth=auth, timeout=15)
         if res.status_code == 200:
             states = res.json().get("states", []) or []
             log(f"[ OpenSky ] Fallback returned {len(states)} regional aircraft.")
@@ -267,14 +262,42 @@ def is_us_military_hex(icao_hex: str) -> bool:
     except Exception:
         return False
 
-def is_israeli_military(icao_hex: str, callsign: str) -> bool:
+def is_israeli_military(icao_hex: str, callsign: str, typecode: str, db_flags: int) -> bool:
+    """Strictly identifies Israeli Air Force flights (zero commercial airline false positives)."""
+    callsign = callsign.upper().strip()
+    typecode = typecode.upper().strip()
+    icao_hex = icao_hex.lower().strip()
+
+    if any(callsign.startswith(p) for p in ["IAF", "ISF", "KNAF", "ISR01"]):
+        return True
+    if callsign in ["EITAM", "SHAVIT", "ORON"]:
+        return True
+
+    # Check Israeli military Mode-S block (0x738000 to 0x738FFF)
     try:
         val = int(icao_hex, 16)
         if 0x738000 <= val <= 0x738FFF:
-            return True
+            if db_flags == 1:
+                return True
+            if typecode in ["G550", "GLF5", "B707", "C130", "C30J", "B767", "F15", "F16", "F35"]:
+                return True
     except Exception:
         pass
-    return any(callsign.startswith(p) for p in ISRAEL_CALLSIGNS)
+
+    return False
+
+def is_us_military(icao_hex: str, callsign: str, typecode: str, db_flags: int) -> bool:
+    callsign = callsign.upper().strip()
+    typecode = typecode.upper().strip()
+    icao_hex = icao_hex.lower().strip()
+
+    if is_us_military_hex(icao_hex):
+        return True
+    if db_flags == 1 and (typecode in AIRCRAFT_NAMES or any(callsign.startswith(p) for p in US_LOGISTICS_CALLSIGNS)):
+        return True
+    if any(callsign.startswith(p) for p in US_LOGISTICS_CALLSIGNS):
+        return True
+    return False
 
 def in_mideast_theater(lat, lon) -> bool:
     return lat is not None and lon is not None and MIDEAST_LAT_MIN <= lat <= MIDEAST_LAT_MAX and MIDEAST_LON_MIN <= lon <= MIDEAST_LON_MAX
@@ -300,23 +323,20 @@ def is_target_flight(ac: dict) -> bool:
     typecode = str(ac.get("t", "")).strip().upper()
     db_flags = ac.get("dbFlags", 0)
 
-    is_mil = (
-        is_us_military_hex(icao)
-        or is_israeli_military(icao, callsign)
-        or db_flags == 1
-        or (typecode in AIRCRAFT_NAMES)
-        or any(callsign.startswith(p) for p in US_LOGISTICS_CALLSIGNS + ISRAEL_CALLSIGNS + ALLIED_MIL_PREFIXES)
-    )
-    if not is_mil:
+    is_us = is_us_military(icao, callsign, typecode, db_flags)
+    is_il = is_israeli_military(icao, callsign, typecode, db_flags)
+    is_allied = any(callsign.startswith(p) for p in ALLIED_MIL_PREFIXES)
+
+    if not (is_us or is_il or is_allied):
         return False
 
     if in_mideast_theater(lat, lon):
         return True
 
     if in_transatlantic_or_europe(lat, lon):
-        if typecode in STRATEGIC_LOGISTICS_TYPES:
+        if typecode in STRATEGIC_LOGISTICS_TYPES or is_il:
             return True
-        if any(callsign.startswith(p) for p in US_LOGISTICS_CALLSIGNS + ISRAEL_CALLSIGNS):
+        if any(callsign.startswith(p) for p in US_LOGISTICS_CALLSIGNS):
             return True
 
     return False
@@ -361,6 +381,7 @@ def evaluate_abnormal_patterns(state, target_flights, civil_hormuz_count):
         icao = str(ac.get("hex", "")).strip().lower()
         callsign = str(ac.get("flight", "")).strip().upper()
         typecode = str(ac.get("t", "")).strip().upper()
+        db_flags = ac.get("dbFlags", 0)
         track = ac.get("track")
         lat, lon = ac.get("lat"), ac.get("lon")
 
@@ -379,19 +400,18 @@ def evaluate_abnormal_patterns(state, target_flights, civil_hormuz_count):
             elif is_west and (lon and lon > 15.0):
                 outbound_airlift.append(ac)
 
-        if is_israeli_military(icao, callsign) or typecode in ["G550", "GLF5", "B707", "B767"]:
+        if is_israeli_military(icao, callsign, typecode, db_flags):
             israeli_strategic.append(ac)
 
         if typecode in ["E4B", "VC25", "C32", "E6B"]:
             doomsday_vip.append(ac)
 
-    # Threshold rules
     if bombers:
         anomalies.append(f"💣 <b>STRATEGIC BOMBERS ACTIVE:</b> {len(bombers)} Heavy Bomber(s) airborne.")
         evidence_aircraft.extend(bombers)
 
     if len(inbound_airlift) >= 3:
-        anomalies.append(f"📦 <b>MASS AIRLIFT BUILD-UP:</b> {len(inbound_airlift)} Transports inbound to Mideast.")
+        anomalies.append(f"📦 <b>MASS AIRLIFT BUILD-UP:</b> {len(inbound_airlift)} Strategic Transports inbound to Mideast.")
         evidence_aircraft.extend(inbound_airlift)
 
     if len(outbound_airlift) >= 3:
@@ -420,20 +440,51 @@ def evaluate_abnormal_patterns(state, target_flights, civil_hormuz_count):
     return anomalies, evidence_aircraft
 
 # ==================================================================
-# SCREENSHOT CAPTURE (Isolates ALL Cumulative Flights on the Map)
+# MAP VIEW CALCULATION (Wide Overview Framing)
+# ==================================================================
+
+def calculate_wide_view(ac_list: list):
+    """Calculates a wide-angle framing so origin and destination paths are clearly visible."""
+    lats = [ac["lat"] for ac in ac_list if ac.get("lat") is not None]
+    lons = [ac["lon"] for ac in ac_list if ac.get("lon") is not None]
+    if not lats or not lons:
+        return 34.0, 25.0, 4
+
+    min_lat, max_lat = min(lats), max(lats)
+    min_lon, max_lon = min(lons), max(lons)
+    center_lat = (min_lat + max_lat) / 2
+    center_lon = (min_lon + max_lon) / 2
+
+    span_lat = max_lat - min_lat
+    span_lon = max_lon - min_lon
+
+    # Force wide zoom levels so it is never a close-up
+    if span_lon > 40 or span_lat > 25:
+        zoom = 4
+    elif span_lon > 15 or span_lat > 10:
+        zoom = 5
+    else:
+        zoom = 5
+
+    return round(center_lat, 2), round(center_lon, 2), zoom
+
+# ==================================================================
+# SCREENSHOT CAPTURE (Full Map, Flight Trails, No Close-Up Sidebar)
 # ==================================================================
 
 def _screenshot(map_url: str, filename: str, render_wait_ms: int = 8000):
     try:
         with sync_playwright() as p:
+            # Launch with software WebGL to guarantee map tiles render instead of flat gray
             browser = p.chromium.launch(
                 headless=True,
                 args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-web-security",
+                    "--enable-webgl",
+                    "--use-gl=swiftshader",
                     "--disable-dev-shm-usage",
-                    "--disable-gpu",
                 ],
             )
             context = browser.new_context(
@@ -443,6 +494,29 @@ def _screenshot(map_url: str, filename: str, render_wait_ms: int = 8000):
             page = context.new_page()
             page.goto(map_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(render_wait_ms)
+
+            # Toggle 'T' to force display full origin-to-destination flight path trails
+            try:
+                page.keyboard.press("t")
+                page.wait_for_timeout(800)
+            except Exception:
+                pass
+
+            # Force sidebar closed and remove any focused plane info block
+            page.evaluate('''() => {
+                try {
+                    if (typeof deselectSelectedAircraft === 'function') deselectSelectedAircraft();
+                    const sb = document.getElementById('sidebar');
+                    if (sb) sb.style.display = 'none';
+                    const info = document.getElementById('selected_infoblock');
+                    if (info) info.style.display = 'none';
+                    const buttons = document.getElementsByClassName('ol-control');
+                    for (let b of buttons) b.style.display = 'none';
+                    if (window.OLMap) window.OLMap.updateSize();
+                } catch(e) {}
+            }''')
+
+            page.wait_for_timeout(1000)
             page.screenshot(path=filename, full_page=False)
             browser.close()
 
@@ -455,26 +529,25 @@ def _screenshot(map_url: str, filename: str, render_wait_ms: int = 8000):
         return None
 
 def capture_cumulative_flights_map(ac_list: list) -> str:
-    """
-    CRITICAL FEATURE:
-    Passes comma-separated hex IDs of ALL detected cumulative flights into tar1090.
-    - icaoFilter: isolates ONLY these aircraft on the map (all other traffic hidden).
-    - icao: selects them to display their flight track lines.
-    - enableLabels: prints callsigns and types directly next to each plane icon.
-    """
+    """Captures a wide-angle map isolating all cumulative flights with their complete flight paths."""
     hexes = [str(ac.get("hex", "")).strip().lower() for ac in ac_list if ac.get("hex")]
     hex_str = ",".join(hexes[:30])
+    center_lat, center_lon, zoom = calculate_wide_view(ac_list)
 
     if hex_str:
-        map_url = f"https://globe.adsb.lol/?icaoFilter={hex_str}&icao={hex_str}&enableLabels&hideSidebar"
+        # tempTrails=7200 renders past 2 hours of flight path tracks
+        map_url = (
+            f"https://globe.adsb.lol/?icaoFilter={hex_str}&lat={center_lat}&lon={center_lon}&zoom={zoom}"
+            f"&enableLabels&extendedLabels=2&tempTrails=7200&hideSidebar&hideButtons"
+        )
     else:
-        map_url = f"https://globe.adsb.lol/?lat={CUMULATIVE_MAP_LAT}&lon={CUMULATIVE_MAP_LON}&zoom={CUMULATIVE_MAP_ZOOM}&filterMil&hideSidebar"
+        map_url = f"https://globe.adsb.lol/?lat={center_lat}&lon={center_lon}&zoom={zoom}&filterMil&hideSidebar&hideButtons"
 
-    log(f"[ Playwright ] Capturing cumulative map for {len(hexes)} isolated flights...")
+    log(f"[ Playwright ] Capturing wide overview map (Zoom {zoom}) for {len(hexes)} flights...")
     return _screenshot(map_url, "cumulative_flights.png", render_wait_ms=8500)
 
 def capture_regional_overview_map() -> str:
-    map_url = f"https://globe.adsb.lol/?lat={OVERVIEW_LAT}&lon={OVERVIEW_LON}&zoom={OVERVIEW_ZOOM}&hideSidebar"
+    map_url = f"https://globe.adsb.lol/?lat={OVERVIEW_LAT}&lon={OVERVIEW_LON}&zoom={OVERVIEW_ZOOM}&hideSidebar&hideButtons"
     return _screenshot(map_url, "regional_overview.png", render_wait_ms=8000)
 
 def cleanup_file(path):
@@ -485,15 +558,11 @@ def cleanup_file(path):
             pass
 
 # ==================================================================
-# TELEGRAM DISPATCH (Screenshot with Report in Caption)
+# TELEGRAM DISPATCH (Photo with Report in Caption)
 # ==================================================================
 
 def send_telegram_alert(caption: str, photo_path: str):
-    """
-    Ensures the report is ALWAYS attached as the caption of the screenshot.
-    Truncates to 1020 chars if needed so Telegram's 1024-character photo caption
-    limit is never exceeded.
-    """
+    """Guarantees the report is sent directly in the caption of the screenshot."""
     if len(caption) > 1024:
         caption = caption[:1020] + "..."
 
@@ -508,14 +577,13 @@ def send_telegram_alert(caption: str, photo_path: str):
                     timeout=35,
                 ).json()
             if res.get("ok"):
-                log(f"[ Telegram ] Photo with report caption delivered successfully.")
+                log(f"[ Telegram ] Photo report delivered successfully.")
                 return True
             else:
                 log(f"[ Telegram Warn ] sendPhoto rejected: {res}. Falling back to text.")
         except Exception as e:
             log(f"[ Telegram Error ] sendPhoto failed: {e}")
 
-    # Fallback to plain text if photo fails
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": TELEGRAM_CHANNEL_ID, "text": caption, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
@@ -577,7 +645,7 @@ def check_and_send_12h_report(state, raw_aircraft):
 
 def run_tracker():
     log("==================================================")
-    log("   OSINT Sky Radar — Strategic Alert & Pipeline    ")
+    log("   OSINT Sky Radar — US & Israeli Strategic Fleet  ")
     log("==================================================")
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
@@ -591,18 +659,16 @@ def run_tracker():
         log("[ ABORT ] All ADS-B sources returned 0 aircraft. Halting run to protect baseline.")
         return
 
-    # Update baselines
-    mideast_flights = [ac for ac in raw_aircraft if in_mideast_theater(ac.get("lat"), ac.get("lon"))]
     civil_hormuz_flights = [ac for ac in raw_aircraft if not is_target_flight(ac) and in_hormuz_corridor(ac.get("lat"), ac.get("lon"))]
     target_flights = [ac for ac in raw_aircraft if is_target_flight(ac)]
 
     state["mil_snapshot_log"].append({"ts": now_utc().isoformat(), "count": len(target_flights)})
     state["civil_corridor_log"].append({"ts": now_utc().isoformat(), "count": len(civil_hormuz_flights)})
 
-    # 1. Dispatch independent 12-hour Regional & Iran airspace briefing
+    # 1. Independent 12-hour Regional & Iran airspace briefing
     check_and_send_12h_report(state, raw_aircraft)
 
-    # 2. REAL-TIME ANOMALY & BUILD-UP / EGRESS DETECTION
+    # 2. Real-time Anomaly, Build-Up, and Egress Evaluation
     anomalies, evidence_aircraft = evaluate_abnormal_patterns(state, target_flights, len(civil_hormuz_flights))
 
     if anomalies:
@@ -619,12 +685,11 @@ def run_tracker():
 
         if should_post_anomaly:
             log(f"[ FLASH ALERT ] Anomaly detected: {anomalies}")
-            # Screenshot isolates the exact evidence aircraft
             anomaly_map = capture_cumulative_flights_map(evidence_aircraft)
 
             anomaly_lines = [
                 f"🚨 <b>STRATEGIC MILITARY ANOMALY ALERT</b> 🚨",
-                f"⚠️ <b>Abnormal Build-Up / Egress Vector</b>",
+                f"⚠️ <b>Abnormal Build-Up / Movement Vector</b>",
                 f"⏱ <b>Timestamp:</b> <code>{now_utc().strftime('%Y-%m-%d %H:%M UTC')}</code>\n",
                 f"<b>Key Indicators:</b>"
             ]
@@ -651,7 +716,7 @@ def run_tracker():
             state["last_anomaly_ts"] = now_utc().isoformat()
             log("[ FLASH ALERT ] Delivered urgent anomaly alert with attached screenshot.")
 
-    # 3. ROUTINE CUMULATIVE DIGEST (Batches all cumulative flights into ONE report + screenshot)
+    # 3. Routine Cumulative Digest (Dispatches when new flights appear along the pipeline)
     new_flights = []
     for ac in target_flights:
         icao = str(ac.get("hex", "")).strip().lower()
@@ -666,19 +731,26 @@ def run_tracker():
 
     log(f"[ Activity ] {len(target_flights)} active military flights ({len(new_flights)} new arrivals).")
 
-    # Only post routine digest if new flights appeared and no anomaly was just posted
     if len(new_flights) > 0 and not anomalies:
-        # Screenshot isolates ALL currently active target flights on the map with callsign labels
+        # Capture wide-angle overview map isolating all cumulative flights with full tracks
         cumulative_map = capture_cumulative_flights_map(target_flights)
 
-        groups = {"transatlantic": [], "europe": [], "mideast": []}
+        groups = {"israel": [], "transatlantic": [], "europe": [], "mideast": []}
         for ac in target_flights:
-            lat, lon = ac.get("lat"), ac.get("lon")
-            g = get_region_group(lat, lon)
-            groups[g].append(ac)
+            icao = str(ac.get("hex", "")).strip().lower()
+            callsign = str(ac.get("flight", "")).strip().upper()
+            typecode = str(ac.get("t", "")).strip().upper()
+            db_flags = ac.get("dbFlags", 0)
+
+            if is_israeli_military(icao, callsign, typecode, db_flags):
+                groups["israel"].append(ac)
+            else:
+                lat, lon = ac.get("lat"), ac.get("lon")
+                g = get_region_group(lat, lon)
+                groups[g].append(ac)
 
         lines = [
-            f"🚨 <b>US & ALLIED MILITARY AIR MOBILITY</b> 🚨",
+            f"🚨 <b>US & ISRAELI MILITARY AIR MOBILITY</b> 🚨",
             f"⏱ <b>Active Fleet Snapshot:</b> <code>{now_utc().strftime('%Y-%m-%d %H:%M UTC')}</code>",
             f"✈️ <b>Total Airborne:</b> <code>{len(target_flights)}</code> (<code>+{len(new_flights)} new</code>)\n"
         ]
@@ -705,8 +777,9 @@ def run_tracker():
                 rendered_count += 1
             lines.append("")
 
-        render_group("🌊 TRANSATLANTIC & CONUS:", groups["transatlantic"])
-        render_group("🇪🇺 EUROPEAN CORRIDORS:", groups["europe"])
+        render_group("🇮🇱 ISRAELI AIR FORCE STRATEGIC ASSETS:", groups["israel"])
+        render_group("🌊 TRANSATLANTIC & CONUS AIR BRIDGE:", groups["transatlantic"])
+        render_group("🇪🇺 EUROPEAN TRANSIT CORRIDORS:", groups["europe"])
         render_group("🌐 MIDDLE EAST FORWARD THEATER:", groups["mideast"])
 
         remaining = len(target_flights) - rendered_count
@@ -717,10 +790,9 @@ def run_tracker():
         lines.append("📡 @secretollah")
 
         caption = "\n".join(lines)
-        # SENDS THE SCREENSHOT OF ALL CUMULATIVE FLIGHTS WITH REPORT IN CAPTION
         send_telegram_alert(caption, cumulative_map)
         cleanup_file(cumulative_map)
-        log("[ Digest Delivered ] Cumulative military fleet dispatch posted successfully.")
+        log("[ Digest Delivered ] Wide cumulative screenshot with report in caption delivered.")
 
     save_state(state)
     log("[ Complete ] Run finished.")
